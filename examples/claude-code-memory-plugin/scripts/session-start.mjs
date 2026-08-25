@@ -58,9 +58,10 @@ function approve(additionalContext, source) {
       additionalContext,
     };
     // mengxy-patch 刀5: toast — count inline memories OR available-memories file index
-    const n = (additionalContext.match(/\[memory /g) || []).length
-      || (additionalContext.match(/^\s+- \S+\.md$/gm) || []).length;
-    out.systemMessage = `🧠 OpenViking ${source || "start"} · ${n ? n + " memories" : "context ready"}`;
+    const nMem = (additionalContext.match(/\[memory /g) || []).length;
+    const nIdx = (additionalContext.match(/^\s+- \S+\.md$/gm) || []).length;
+    out.systemMessage = `🧠 OpenViking ${source || "start"} · ${
+      nMem ? nMem + " memories" : nIdx ? nIdx + " indexed" : "context ready"}`;
   }
   output(out);
 }
