@@ -264,7 +264,7 @@ async function searchScope(queryText, targetUri, limit) {
 
 async function searchUserScope(queryText, limit) {
   console.log(`${C.dim}Searching user scope...${C.reset}`);
-  const userMems = await searchScope(queryText, "viking://~/memories", limit);
+  const userMems = await searchScope(queryText, "viking://user/default/memories", limit);
 
   const uriSet = new Set();
   return {

@@ -16,6 +16,8 @@ const USER_RESERVED_DIRS = new Set(["memories", "skills"]);
 const SOURCES = [
   { type: "memory", uri: "viking://~/memories", bucket: "memories" },
   { type: "skill", uri: "viking://~/skills", bucket: "skills" },
+  // mengxy-patch: cwd peer project memories (server filters by actor peer)
+  { type: "memory", uri: "viking://~/peers", bucket: "memories" },
 ];
 const DEFAULT_CONTEXT_LIMIT = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS = 1600;
@@ -274,7 +276,9 @@ async function resolveTargetUri(fetchJSON, targetUri, actorPeerId = "") {
   const trimmed = targetUri.trim().replace(/\/+$/, "");
   // viking://~ is the home alias: the server expands it to the caller's own user
   // space, so it needs no client-side rewrite.
-  if (trimmed === "viking://~" || trimmed.startsWith("viking://~/")) return trimmed;
+  // mengxy-patch: 0.4.13/16 dev-mode server rejects/unresolves '~' — rewrite to explicit uid
+  if (trimmed === "viking://~") return "viking://user/default";
+  if (trimmed.startsWith("viking://~/")) return "viking://user/default/" + trimmed.slice("viking://~/".length);
   // Legacy compat: uid-less viking://user/<reserved> URIs may still sit in plugin
   // configs. Newer servers reject them, so rewrite to an explicit-uid URI here.
   const m = trimmed.match(/^viking:\/\/user(?:\/(.*))?$/);
@@ -441,6 +445,9 @@ export async function buildServerAssembledBlock(fetchJSON, cfg, query, options =
   const actorPeerId = options.actorPeerId ?? cfg.peerId ?? "";
   const log = options.log || (() => {});
 
+  // mengxy-patch: server face/recall endpoints answer unreliably (VLM rewrite
+  // flakiness) and ignore peer scoping — always use local 3-source find.
+  return null;
   const block = await recallViaContextFace(fetchJSON, cfg, query, { ...options, actorPeerId }, log);
   if (block !== null) return block;
   return recallViaEndpoint(fetchJSON, cfg, query, actorPeerId, log);
@@ -552,7 +559,8 @@ async function recallViaEndpoint(fetchJSON, cfg, query, actorPeerId = "", log = 
     return null;
   }
   const rendered = String(res.result?.rendered || "").trim();
-  if (!rendered) return "";
+  // mengxy-patch: empty rendered — treat as unusable, fall back to local search.
+  if (!rendered) return null;
   return wrapContext(rendered);
 }
 

@@ -57,6 +57,9 @@ function approve(additionalContext) {
       hookEventName: "SessionStart",
       additionalContext,
     };
+    // mengxy-patch 刀5: toast
+    const n = (additionalContext.match(/\[memory /g) || []).length;
+    out.systemMessage = n ? `OV 开局注入 ${n} 条记忆` : "OV 开局注入上下文";
   }
   output(out);
 }

@@ -37,7 +37,12 @@ function output(obj) {
 
 function approve(msg) {
   const out = { decision: "approve" };
-  if (msg) out.hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: msg };
+  if (msg) {
+    out.hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: msg };
+    // mengxy-patch 刀5: toast
+    const n = (msg.match(/\[memory /g) || []).length;
+    out.systemMessage = n ? `OV 召回 ${n} 条记忆` : "OV 注入上下文";
+  }
   output(out);
 }
 
@@ -155,7 +160,9 @@ async function resolveTargetUri(targetUri, actorPeerId = "") {
   const trimmed = targetUri.trim().replace(/\/+$/, "");
   // viking://~ is the home alias: the server expands it to the caller's own user
   // space, so it needs no client-side rewrite.
-  if (trimmed === "viking://~" || trimmed.startsWith("viking://~/")) return trimmed;
+  // mengxy-patch: 0.4.13/16 dev-mode server rejects/unresolves '~' — rewrite to explicit uid
+  if (trimmed === "viking://~") return "viking://user/default";
+  if (trimmed.startsWith("viking://~/")) return "viking://user/default/" + trimmed.slice("viking://~/".length);
   // Legacy compat: uid-less viking://user/<reserved> URIs may still sit in plugin
   // configs. Newer servers reject them, so rewrite to an explicit-uid URI here.
   const m = trimmed.match(/^viking:\/\/user(?:\/(.*))?$/);
@@ -177,6 +184,8 @@ async function resolveTargetUri(targetUri, actorPeerId = "") {
 const SOURCES = [
   { type: "memory", uri: "viking://~/memories",  bucket: "memories" },
   { type: "skill",  uri: "viking://~/skills",    bucket: "skills"   },
+  // mengxy-patch: cwd peer project memories (server filters by actor peer)
+  { type: "memory", uri: "viking://~/peers",     bucket: "memories" },
 ];
 
 async function searchOneSource(query, source, limit, actorPeerId = "") {
