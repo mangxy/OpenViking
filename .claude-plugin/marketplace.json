@@ -1,8 +1,8 @@
 {
-  "name": "openviking",
+  "name": "openviking-fork",
   "description": "OpenViking plugins for Claude Code.",
   "owner": {
-    "name": "OpenViking"
+    "name": "mangxy"
   },
   "plugins": [
     {
@@ -10,7 +10,7 @@
       "description": "Long-term semantic memory for Claude Code, powered by OpenViking",
       "source": {
         "source": "git-subdir",
-        "url": "https://github.com/volcengine/OpenViking.git",
+        "url": "https://github.com/mangxy/OpenViking.git",
         "path": "examples/claude-code-memory-plugin",
         "ref": "main"
       },

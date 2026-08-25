@@ -656,11 +656,11 @@ async function main() {
       ov_session_id: ovSessionId,
       cc_session_id: sessionId,
     });
-    approve(result.queued > 0 ? `queued ${result.queued} turns to pending queue` : undefined);
+    approve(result.queued > 0 ? `🧠 OpenViking · Queued ${result.queued} turns (server down, will replay)` : undefined);
     return;
   } else {
     logError("health_check", `non-retryable status ${health.status || "unknown"}`);
-    approve();
+    approve("🧠 OpenViking · Auto-save failed (will retry)");
     return;
   }
   log("push_turns", {
@@ -681,6 +681,7 @@ async function main() {
       "capture_write",
       "some turns were neither sent nor queued; state not advanced",
     );
+    approve("🧠 OpenViking · Auto-save failed (will retry)");
     writeJsonState("last-capture.json", {
       turns_captured: result.ok,
       turns_queued: result.queued,
@@ -765,15 +766,10 @@ async function main() {
   }
 
   if (result.ok > 0) {
-    approve(
-      `captured ${result.ok} turns to ov session ${ovSessionId}` +
-      (committed
-        ? ` (committed${commitTraceId ? `; trace_id=${commitTraceId}` : ""})`
-        : ""),
-    );
+    approve(`🧠 OpenViking · Auto-saved · ${result.ok} turns${committed ? " · committed ✓" : ""}`);
   } else {
     approve();
   }
 }
 
-main().catch((err) => { logError("uncaught", err); approve(); });
+main().catch((err) => { logError("uncaught", err); approve("🧠 OpenViking · Auto-save failed (will retry)"); });

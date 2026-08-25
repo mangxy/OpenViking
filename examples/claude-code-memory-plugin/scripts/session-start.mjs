@@ -50,7 +50,7 @@ function output(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-function approve(additionalContext) {
+function approve(additionalContext, source) {
   const out = { decision: "approve" };
   if (additionalContext) {
     out.hookSpecificOutput = {
@@ -59,7 +59,7 @@ function approve(additionalContext) {
     };
     // mengxy-patch 刀5: toast
     const n = (additionalContext.match(/\[memory /g) || []).length;
-    out.systemMessage = n ? `OV 开局注入 ${n} 条记忆` : "OV 开局注入上下文";
+    out.systemMessage = `🧠 OpenViking ${source || "start"} · ${n ? n + " memories" : "context ready"}`;
   }
   output(out);
 }
@@ -214,7 +214,7 @@ async function main() {
     },
     archive: Boolean(archiveSection),
   });
-  approve(composed);
+  approve(composed, source);
 }
 
 main().catch((err) => { logError("uncaught", err); approve(); });

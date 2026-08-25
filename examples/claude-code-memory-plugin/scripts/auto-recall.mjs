@@ -41,7 +41,7 @@ function approve(msg) {
     out.hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: msg };
     // mengxy-patch 刀5: toast
     const n = (msg.match(/\[memory /g) || []).length;
-    out.systemMessage = n ? `OV 召回 ${n} 条记忆` : "OV 注入上下文";
+    out.systemMessage = n ? `🧠 OpenViking Recall ${n} memories` : "🧠 OpenViking context";
   }
   output(out);
 }

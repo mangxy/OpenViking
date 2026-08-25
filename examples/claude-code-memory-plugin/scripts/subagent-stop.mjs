@@ -43,8 +43,10 @@ const { log, logError } = createLogger("subagent-stop");
 
 const STATE_DIR = join(tmpdir(), "openviking-cc-subagent-state");
 
-function approve() {
-  process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
+function approve(msg) {
+  const out = { decision: "approve" };
+  if (msg) out.systemMessage = msg;
+  process.stdout.write(JSON.stringify(out) + "\n");
 }
 
 function stateFile(subagentId) {
@@ -361,19 +363,23 @@ async function main() {
     result = await pushTurns(ovSessionId, turns, { peerId, enqueueOnly: true });
   } else {
     logError("health_check", `non-retryable status ${health.status || "unknown"}`);
-    approve();
+    approve("🧠 OpenViking · Subagent capture failed (will retry)");
     return;
   }
   log("push_turns", { ovSessionId, ...result });
 
   if (result.enqueueFailed > 0) {
     logError("pending_enqueue", "some turns failed to enqueue; state file retained");
-    approve();
+    approve("🧠 OpenViking · Subagent capture failed (will retry)");
     return;
   }
 
   await unlink(stateFile(subagentId)).catch(() => {});
-  approve();
+  approve(result.ok > 0
+    ? `🧠 OpenViking · Subagent saved · ${result.ok} turns`
+    : result.queued > 0
+      ? `🧠 OpenViking · Subagent queued · ${result.queued} turns (server down)`
+      : undefined);
 }
 
 main().catch((err) => { logError("uncaught", err); approve(); });
