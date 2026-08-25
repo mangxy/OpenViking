@@ -8,9 +8,7 @@
     {
       "name": "openviking-memory",
       "description": "Long-term semantic memory for Claude Code, powered by OpenViking",
-      "source": {
-        "source": "./examples/claude-code-memory-plugin"
-      },
+      "source": "./examples/claude-code-memory-plugin",
       "category": "productivity"
     }
   ]
