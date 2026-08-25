@@ -57,8 +57,9 @@ function approve(additionalContext, source) {
       hookEventName: "SessionStart",
       additionalContext,
     };
-    // mengxy-patch 刀5: toast
-    const n = (additionalContext.match(/\[memory /g) || []).length;
+    // mengxy-patch 刀5: toast — count inline memories OR available-memories file index
+    const n = (additionalContext.match(/\[memory /g) || []).length
+      || (additionalContext.match(/^\s+- \S+\.md$/gm) || []).length;
     out.systemMessage = `🧠 OpenViking ${source || "start"} · ${n ? n + " memories" : "context ready"}`;
   }
   output(out);
