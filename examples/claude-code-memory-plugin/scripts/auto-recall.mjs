@@ -35,9 +35,13 @@ function output(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-function approve(msg) {
+function approve(msg, systemMessage) {
   const out = { decision: "approve" };
-  if (msg) out.hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: msg };
+  if (msg) {
+    out.hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: msg };
+    // Optional one-line toast so the user sees how much was recalled.
+    if (systemMessage) out.systemMessage = systemMessage;
+  }
   output(out);
 }
 
@@ -398,8 +402,9 @@ async function main() {
       approve();
       return;
     }
+    const recalledCount = new Set(endpointBlock.match(/viking:\/\/[^\s<>"')\]]+/g) || []).size;
     writeRecallState({
-      count: new Set(endpointBlock.match(/viking:\/\/[^\s<>"')\]]+/g) || []).size,
+      count: recalledCount,
       content_items: 1,
       hint_items: 0,
       tokens_used: estimateTokens(endpointBlock),
@@ -407,7 +412,7 @@ async function main() {
       cc_session_id: sessionId,
       reason: "ok",
     });
-    approve(endpointBlock);
+    approve(endpointBlock, cfg.toast ? `🧠 OpenViking recall: ${recalledCount} memories` : null);
     return;
   }
 
@@ -449,7 +454,7 @@ async function main() {
     cc_session_id: sessionId,
     reason: "ok",
   });
-  approve(built?.block);
+  approve(built?.block, cfg.toast ? `🧠 OpenViking recall: ${picked.length} memories` : null);
 }
 
 main().catch((err) => { logError("uncaught", err); approve(); });

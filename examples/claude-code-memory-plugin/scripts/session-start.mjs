@@ -50,13 +50,15 @@ function output(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-function approve(additionalContext) {
+function approve(additionalContext, systemMessage) {
   const out = { decision: "approve" };
   if (additionalContext) {
     out.hookSpecificOutput = {
       hookEventName: "SessionStart",
       additionalContext,
     };
+    // Optional one-line toast so the user sees the plugin injected context.
+    if (systemMessage) out.systemMessage = systemMessage;
   }
   output(out);
 }
@@ -188,6 +190,12 @@ async function main() {
   const composed = `<openviking-context source="${source}">\n${sections.join("\n")}\n</openviking-context>`;
   writeLastInject(composed);
 
+  const toast = cfg.toast
+    ? `🧠 OpenViking ${source}: injected ${
+        profile ? `${profile.prefCount} preferences + ${profile.entCount} entities` : "context"
+      }${archiveSection ? " + session archive" : ""}`
+    : null;
+
   if (cfg.debug) {
     process.stderr.write(
       `[ov] session-start injected ~${composed.length} chars / ~${estimateTokens(composed)} tokens` +
@@ -211,7 +219,7 @@ async function main() {
     },
     archive: Boolean(archiveSection),
   });
-  approve(composed);
+  approve(composed, toast);
 }
 
 main().catch((err) => { logError("uncaught", err); approve(); });
