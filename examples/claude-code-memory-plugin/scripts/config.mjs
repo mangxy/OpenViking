@@ -202,6 +202,11 @@ export function loadConfig() {
   const defaultLogPath = join(homedir(), ".openviking", "logs", "cc-hooks.log");
   const debugLogPath = str(process.env.OPENVIKING_DEBUG_LOG, defaultLogPath);
 
+  // Injected-context toast: a one-line systemMessage alongside additionalContext
+  // so the user can see the plugin is alive and how much it recalled. Opt-out
+  // via OPENVIKING_TOAST=0 or cc.toast=false.
+  const toast = envBool("OPENVIKING_TOAST") ?? (cc.toast !== false);
+
   const timeoutMs = Math.max(1000, Math.floor(num(
     process.env.OPENVIKING_TIMEOUT_MS,
     num(cc.timeoutMs, 15000),
@@ -233,6 +238,7 @@ export function loadConfig() {
     workspacePeer,
     timeoutMs,
     userAgent: USER_AGENT,
+    toast,
 
     // Recall
     autoRecall: envBool("OPENVIKING_AUTO_RECALL") ?? (cc.autoRecall !== false),
