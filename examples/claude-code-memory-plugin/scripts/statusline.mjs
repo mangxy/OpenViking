@@ -157,7 +157,7 @@ async function main() {
   // this session out of OV. The context indicator stays — it describes the
   // CC conversation, not OV, and this line is all the user gets.
   if (isBypassed(cfg, { sessionId, cwd })) {
-    const bypassParts = [yellow("OV ⚡ bypass")];
+    const bypassParts = [yellow("OpenViking ⚡ bypass")];
     const modelCtx = modelCtxSegment(stdin);
     if (modelCtx) bypassParts.push(modelCtx);
     process.stdout.write(truncate(bypassParts.join(dim(" │ "))));
@@ -173,26 +173,26 @@ async function main() {
   const parts = [];
 
   if (probe.healthy) {
-    parts.push(green("OV ✓"));
+    parts.push(green("OpenViking ✓"));
   } else if (probe.error === "timeout") {
     // "slow" means the probe missed its 1 s budget — the server might be alive
     // but lagging (remote SaaS, GC pause). Yellow keeps it advisory; reserving
     // red for actual unreachability (refused, DNS, etc.) makes the distinction
     // legible at a glance.
-    parts.push(yellow("OV ⚠ slow"));
+    parts.push(yellow("OpenViking ⚠ slow"));
   } else {
-    parts.push(red("OV ✗ offline"));
+    parts.push(red("OpenViking ✗ offline"));
   }
 
-  const modelCtx = modelCtxSegment(stdin);
-  if (modelCtx) parts.push(modelCtx);
+  // mengxy-patch: model·ctx 段砍除（拼 HUD 行尾，HUD 首行已显，冗余）
+  // const modelCtx = modelCtxSegment(stdin);
+  // if (modelCtx) parts.push(modelCtx);
 
   // Recall summary: only meaningful when we actually injected memories this
   // turn. Skip the segment for empty/bypass/no-results reasons to keep the
   // line tight. Count confirms the injection; latency shows its round-trip cost.
   if (recall && recall.reason === "ok" && recall.count > 0) {
-    const seg = `↩ ${recall.count} mem`
-      + (typeof recall.latency_ms === "number" ? ` · ${recall.latency_ms}ms` : "");
+    const seg = `↩ ${recall.count} mem`;
     parts.push(dim(seg));
   }
 
