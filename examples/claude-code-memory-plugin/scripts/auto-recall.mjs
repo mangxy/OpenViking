@@ -160,9 +160,7 @@ async function resolveTargetUri(targetUri, actorPeerId = "") {
   const trimmed = targetUri.trim().replace(/\/+$/, "");
   // viking://~ is the home alias: the server expands it to the caller's own user
   // space, so it needs no client-side rewrite.
-  // mengxy-patch: 0.4.13/16 dev-mode server rejects/unresolves '~' — rewrite to explicit uid
-  if (trimmed === "viking://~") return "viking://user/default";
-  if (trimmed.startsWith("viking://~/")) return "viking://user/default/" + trimmed.slice("viking://~/".length);
+  // mengxy-patch 退役(0.4.20): server 0.4.16+ 原生认 viking://~ 别名,~ 重写刀冗余已拔;legacy uid-less 段保留
   // Legacy compat: uid-less viking://user/<reserved> URIs may still sit in plugin
   // configs. Newer servers reject them, so rewrite to an explicit-uid URI here.
   const m = trimmed.match(/^viking:\/\/user(?:\/(.*))?$/);
