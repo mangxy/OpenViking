@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from openviking_cli.session.user_id import UserIdentifier
 
+from .cache_config import CacheConfig
 from .config_loader import resolve_config_path
 from .config_utils import format_validation_error, raise_unknown_config_fields
 from .consts import (
@@ -135,6 +136,27 @@ class ParserApiConfig(BaseModel):
         return self
 
 
+class CompileApiConfig(BaseModel):
+    """Configuration for the external Compile task API."""
+
+    base_url: str = ""
+    gateway_token: str = ""
+    http_timeout_seconds: float = 10.0
+    poll_interval_ms: int = 30000
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _validate(self) -> "CompileApiConfig":
+        if self.base_url and "://" not in self.base_url:
+            raise ValueError("compile_api.base_url must include scheme (e.g., https://...)")
+        if self.http_timeout_seconds <= 0:
+            raise ValueError("compile_api.http_timeout_seconds must be > 0")
+        if self.poll_interval_ms <= 0:
+            raise ValueError("compile_api.poll_interval_ms must be > 0")
+        self.base_url = self.base_url.rstrip("/")
+        return self
+
+
 class OpenVikingConfig(BaseModel):
     """Main configuration for OpenViking."""
 
@@ -145,6 +167,11 @@ class OpenVikingConfig(BaseModel):
     default_agent: Optional[str] = Field(
         default=None,
         description="Deprecated and ignored. User is the only data-plane identity.",
+    )
+
+    cache: Optional[CacheConfig] = Field(
+        default=None,
+        description="Global cache Provider configuration",
     )
 
     storage: StorageConfig = Field(
@@ -249,6 +276,11 @@ class OpenVikingConfig(BaseModel):
         description="Third-party parser API configuration (files/responses)",
     )
 
+    compile_api: CompileApiConfig = Field(
+        default_factory=CompileApiConfig,
+        description="External Compile task API configuration",
+    )
+
     connector: ConnectorConfig = Field(
         default_factory=ConnectorConfig,
         description="External Connector service configuration for data import",
@@ -306,6 +338,14 @@ class OpenVikingConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_cache_runtime_config(self) -> "OpenVikingConfig":
+        agfs = self.storage.agfs
+        uses_canonical_cache = agfs.cachefs.backend == "cache" or agfs.queuefs.backend == "cache"
+        if uses_canonical_cache and self.cache is None:
+            raise ValueError("top-level cache config is required when an AGFS backend uses cache")
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _inherit_git_defaults_from_agfs(cls, data: Any) -> Any:
@@ -356,6 +396,33 @@ class OpenVikingConfig(BaseModel):
 
         data = dict(data)
         data["git"] = git
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_cache_config(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        storage_value = data.get("storage")
+        if not isinstance(storage_value, dict):
+            return data
+        agfs_value = storage_value.get("agfs")
+        if not isinstance(agfs_value, dict):
+            return data
+        if "cache" in agfs_value:
+            raise ValueError(
+                "storage.agfs.cache has been removed; configure cache.provider/cache.params "
+                "and storage.agfs.cachefs.backend='cache'"
+            )
+        queuefs = agfs_value.get("queuefs")
+        if isinstance(queuefs, dict) and (
+            queuefs.get("backend") == "redis" or "redis" in queuefs
+        ):
+            raise ValueError(
+                "storage.agfs.queuefs backend='redis' and queuefs.redis have been removed; "
+                "use backend='cache' with top-level cache.provider/cache.params"
+            )
         return data
 
     allow_private_networks: bool = Field(

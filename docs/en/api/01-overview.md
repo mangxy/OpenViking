@@ -366,7 +366,18 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | POST | `/api/v1/fs/attrs/set_tags` | Set retrieval tags (compatibility alias) |
 | POST | `/api/v1/fs/mkdir` | Create a directory |
 | DELETE | `/api/v1/fs` | Delete a resource |
+| POST | `/api/v1/fs/cp` | Copy a file or directory together with its vector records |
 | POST | `/api/v1/fs/mv` | Move or rename a resource |
+
+### [ACL](12-acl.md)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/acl` | Get direct, inherited, and effective ACLs |
+| PUT | `/api/v1/acl` | Replace a resource's direct ACL |
+| DELETE | `/api/v1/acl` | Clear a resource's direct ACL |
+| POST | `/api/v1/acl/grant` | Set one principal's direct level |
+| POST | `/api/v1/acl/revoke` | Remove one principal's direct grant |
 
 ### [Content](12-content.md)
 
@@ -454,6 +465,7 @@ This catalog follows the routes actually mounted by the server. Each group headi
 
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/api/v1/compile` | Create an OV-owned Compile task |
 | GET | `/api/v1/tasks/{task_id}` | Get a background task |
 | POST | `/api/v1/tasks/{task_id}/cancel` | Cancel a background task |
 | GET | `/api/v1/tasks` | List background tasks |
@@ -485,6 +497,12 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | DELETE | `/api/v1/admin/accounts/{account_id}/users/{user_id}` | Remove a user |
 | PUT | `/api/v1/admin/accounts/{account_id}/users/{user_id}/role` | Promote a user to ADMIN |
 | POST | `/api/v1/admin/accounts/{account_id}/users/{user_id}/key` | Regenerate a user key |
+| POST | `/api/v1/admin/accounts/{account_id}/groups` | Create a group |
+| GET | `/api/v1/admin/accounts/{account_id}/groups` | List groups |
+| DELETE | `/api/v1/admin/accounts/{account_id}/groups/{group_id}` | Delete a group |
+| GET | `/api/v1/admin/accounts/{account_id}/groups/{group_id}/members` | List group members |
+| PUT | `/api/v1/admin/accounts/{account_id}/groups/{group_id}/members/{user_id}` | Add a group member |
+| DELETE | `/api/v1/admin/accounts/{account_id}/groups/{group_id}/members/{user_id}` | Remove a group member |
 | GET | `/api/v1/privacy-configs` | List privacy configuration categories |
 | GET | `/api/v1/privacy-configs/{category}` | List category targets |
 | GET | `/api/v1/privacy-configs/{category}/{target_key}` | Get the active configuration |
@@ -493,7 +511,7 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | POST | `/api/v1/privacy-configs/{category}/{target_key}` | Write and activate a new version |
 | POST | `/api/v1/privacy-configs/{category}/{target_key}/activate` | Activate a version |
 
-### [OpenViking Assets](22-openviking-assets.md), [WebDAV](20-webdav.md), and [VikingBot API](24-vikingbot.md)
+### [OpenViking Assets](22-openviking-assets.md), [WebDAV](20-webdav.md), [Agent Runtime API](23-agent-runtime.md), and [VikingBot API](24-vikingbot.md)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -506,13 +524,14 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | DELETE | `/webdav/resources`, `/webdav/resources/{resource_path}` | Delete a file or directory |
 | MKCOL | `/webdav/resources`, `/webdav/resources/{resource_path}` | Create a directory |
 | MOVE | `/webdav/resources`, `/webdav/resources/{resource_path}` | Move or rename a resource |
+| POST | `/api/v1/compile` | Create an asynchronous Compile task |
 | GET | `/bot/v1/health` | VikingBot health check |
 | POST | `/bot/v1/chat` | Non-streaming VikingBot chat |
 | POST | `/bot/v1/chat/stream` | Streaming VikingBot chat |
 | POST | `/bot/v1/feedback` | Submit feedback for a VikingBot answer |
-| POST | `/bot/v1/compile` | Start a Skill-driven Compile task |
-| GET | `/bot/v1/compile/{task_id}` | Get Compile task status |
-| POST | `/bot/v1/compile/{task_id}/cancel` | Cancel a Compile task |
+| POST | `/bot/v1/compile` | Retired; returns migration guidance for the new endpoint |
+| GET | `/bot/v1/compile/{task_id}` | Retired; returns Task API migration guidance |
+| POST | `/bot/v1/compile/{task_id}/cancel` | Retired; returns Task cancellation API migration guidance |
 
 ---
 
@@ -526,5 +545,5 @@ The sidebar is organized by responsibility rather than historical file size:
 | Retrieval | Semantic retrieval and code retrieval |
 | Data Lifecycle | Watches, snapshots, and OVPack |
 | Operations & Observability | System, tasks, Observer, and Metrics |
-| Identity & Governance | Administration and privacy configuration |
-| Protocols & Extensions | OpenViking Assets, WebDAV, and VikingBot API |
+| Identity & Governance | Administration, ACL, and privacy configuration |
+| Protocols & Extensions | OpenViking Assets, WebDAV, Agent Runtime API, and VikingBot API |

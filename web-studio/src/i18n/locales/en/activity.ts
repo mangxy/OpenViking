@@ -23,6 +23,8 @@ const activity = {
       shortcut: '⌘ N to create a new session',
     },
     chat: {
+      historyLoadFailed: 'Could not load conversation history: {{error}}',
+      sendFailed: 'Could not send message: {{error}}',
       copy: 'Copy',
       emptyDescription: 'Explore your knowledge base and start a conversation.',
       placeholder: 'Type a message...',
@@ -71,6 +73,7 @@ const activity = {
       loadFailed: 'Could not load memory changes',
       retry: 'Retry',
       empty: 'This session commit did not produce any memory changes.',
+      viewExperienceImpact: 'View impact for this experience',
     },
     empty: {
       description: 'Select a session from the list or create a new one.',
@@ -146,6 +149,10 @@ const activity = {
       terminal: 'Terminal',
       agent: 'Agent',
     },
+    actionPanel: {
+      collapse: 'Collapse panel',
+      expand: 'Open panel',
+    },
     addResource: {
       title: 'Add resource',
       description:
@@ -156,7 +163,9 @@ const activity = {
       title: 'Context tree',
       addResource: 'Add resource',
       abstractLevel: 'L0',
+      collapseDirectory: 'Collapse {{name}}',
       empty: 'empty',
+      expandDirectory: 'Expand {{name}}',
       loading: 'loading',
       overviewLevel: 'L1',
       search: 'Search context',

@@ -8,10 +8,11 @@ import {
   getAdminAccounts,
   getOvResult,
   postAdminAccountIdUserIdKey,
-  postAdminAccountIdUsers,
   postAdminAccounts,
   putAdminAccountIdUserIdRole,
 } from '#/lib/ov-client'
+
+import type { UserMemoryPolicy } from './user-memory-policy'
 
 export type AdminUserRole = 'admin' | 'root' | 'user'
 
@@ -42,6 +43,7 @@ export type CreateAccountInput = {
 }
 
 export type CreateUserInput = {
+  memoryPolicy?: UserMemoryPolicy
   accountId: string
   role: string
   userId: string
@@ -61,8 +63,18 @@ export type UpdateUserRoleInput = {
 
 export type ProbeState = 'ok' | 'error' | 'skipped'
 
+export type CapabilityDetailCode =
+  | 'accountAdminAvailable'
+  | 'adminModeRequired'
+  | 'controlKeyRequired'
+  | 'dataKeyRequired'
+  | 'rootAvailable'
+  | 'tenantDataAvailable'
+  | 'trustedIdentityRequired'
+
 export type CapabilityProbeResult = {
   detail?: string
+  detailCode?: CapabilityDetailCode
   state: ProbeState
 }
 
@@ -163,7 +175,7 @@ async function probeAdminAccess(
   }
   if (input.serverMode === 'dev') {
     return {
-      detail: 'Admin API requires API-key or trusted mode',
+      detailCode: 'adminModeRequired',
       state: 'skipped',
     }
   }
@@ -174,7 +186,7 @@ async function probeAdminAccess(
   const controlKey = input.adminApiKey.trim()
   if (input.serverMode === 'api_key' && !controlKey) {
     return {
-      detail: 'A root or account-admin API key is required',
+      detailCode: 'controlKeyRequired',
       state: 'skipped',
     }
   }
@@ -186,7 +198,7 @@ async function probeAdminAccess(
   try {
     await client.get('/api/v1/admin/accounts', { headers })
     return {
-      detail: 'Root admin control available',
+      detailCode: 'rootAvailable',
       state: 'ok',
     }
   } catch (accountsError) {
@@ -210,7 +222,7 @@ async function probeAdminAccess(
         },
       })
       return {
-        detail: 'Account admin control available',
+        detailCode: 'accountAdminAvailable',
         state: 'ok',
       }
     } catch (usersError) {
@@ -230,7 +242,7 @@ async function probeDataAccess(
   }
   if (input.serverMode === 'api_key' && !input.apiKey) {
     return {
-      detail: 'A user or account-admin API key is required',
+      detailCode: 'dataKeyRequired',
       state: 'skipped',
     }
   }
@@ -239,7 +251,7 @@ async function probeDataAccess(
     (!input.accountId.trim() || !input.userId.trim())
   ) {
     return {
-      detail: 'Trusted mode data access requires account and user',
+      detailCode: 'trustedIdentityRequired',
       state: 'skipped',
     }
   }
@@ -263,7 +275,7 @@ async function probeDataAccess(
       },
     })
     return {
-      detail: 'Tenant data access available',
+      detailCode: 'tenantDataAvailable',
       state: 'ok',
     }
   } catch (error) {
@@ -401,12 +413,16 @@ export async function createAdminUser(
   input: CreateUserInput,
 ): Promise<KeyResult> {
   const result = await getOvResult<unknown>(
-    postAdminAccountIdUsers({
+    createAdminClient(connection).post({
+      url: '/api/v1/admin/accounts/{account_id}/users',
+      headers: { 'Content-Type': 'application/json' },
       body: {
         role: input.role,
         user_id: input.userId,
+        ...(input.memoryPolicy
+          ? { user_config: { memory_policy: input.memoryPolicy } }
+          : {}),
       },
-      client: createAdminClient(connection),
       path: {
         account_id: input.accountId,
       },
@@ -466,6 +482,37 @@ export async function updateAdminUserRole(
         account_id: input.accountId,
         user_id: input.userId,
       },
+    }),
+  )
+}
+
+export type UserMemorySettings = { memory_policy: UserMemoryPolicy }
+
+export async function fetchUserMemorySettings(
+  connection: AdminConnection,
+  accountId: string,
+  userId: string,
+): Promise<UserMemorySettings> {
+  return getOvResult<UserMemorySettings>(
+    createAdminClient(connection).get({
+      url: '/api/v1/admin/accounts/{account_id}/users/{user_id}/settings',
+      path: { account_id: accountId, user_id: userId },
+    }),
+  )
+}
+
+export async function updateUserMemorySettings(
+  connection: AdminConnection,
+  accountId: string,
+  userId: string,
+  memoryPolicy: UserMemoryPolicy,
+): Promise<UserMemorySettings> {
+  return getOvResult<UserMemorySettings>(
+    createAdminClient(connection).patch({
+      url: '/api/v1/admin/accounts/{account_id}/users/{user_id}/settings',
+      path: { account_id: accountId, user_id: userId },
+      headers: { 'Content-Type': 'application/json' },
+      body: { memory_policy: memoryPolicy },
     }),
   )
 }

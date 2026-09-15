@@ -1,18 +1,20 @@
 import * as React from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import {
-  BlocksIcon,
+  MessagesSquareIcon,
   BookOpenIcon,
   BracesIcon,
+  BrainIcon,
   ChevronRightIcon,
-  ClipboardListIcon,
-  Clock3Icon,
+  ListChecksIcon,
+  HistoryIcon,
   HomeIcon,
   GithubIcon,
   KeyRoundIcon,
   MoonIcon,
-  MonitorUpIcon,
-  PlugZapIcon,
+  ActivityIcon,
+  BotIcon,
+  CableIcon,
   ScrollTextIcon,
   SearchIcon,
   SparklesIcon,
@@ -53,6 +55,7 @@ import {
   AppConnectionProvider,
   useAppConnection,
 } from '#/hooks/use-app-connection'
+import type { ServerMode } from '#/hooks/use-server-mode'
 import { cn } from '#/lib/utils'
 import { resolveStudioManagementCapabilities } from '#/lib/studio-permissions'
 
@@ -88,7 +91,7 @@ const NAV_ITEMS: readonly NavItem[] = [
     to: '/home',
   },
   {
-    icon: PlugZapIcon,
+    icon: BotIcon,
     id: 'playground',
     section: 'workspace',
     titleKey: 'navigation.playground.title',
@@ -109,7 +112,14 @@ const NAV_ITEMS: readonly NavItem[] = [
     to: '/skills',
   },
   {
-    icon: BlocksIcon,
+    icon: BrainIcon,
+    id: 'agentExperience',
+    section: 'workspace',
+    titleKey: 'navigation.agentExperience.title',
+    to: '/agent-experience',
+  },
+  {
+    icon: MessagesSquareIcon,
     id: 'sessions',
     section: 'operations',
     titleKey: 'navigation.sessions.title',
@@ -123,21 +133,21 @@ const NAV_ITEMS: readonly NavItem[] = [
     to: '/request-logs',
   },
   {
-    icon: ClipboardListIcon,
+    icon: ListChecksIcon,
     id: 'tasks',
     section: 'operations',
     titleKey: 'navigation.tasks.title',
     to: '/tasks',
   },
   {
-    icon: Clock3Icon,
+    icon: HistoryIcon,
     id: 'watches',
     section: 'operations',
     titleKey: 'navigation.watches.title',
     to: '/watches',
   },
   {
-    icon: MonitorUpIcon,
+    icon: ActivityIcon,
     id: 'monitoring',
     section: 'operations',
     titleKey: 'navigation.monitoring.title',
@@ -246,8 +256,24 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 }
 
 function IdentityScopedAppShell({ children }: { children: React.ReactNode }) {
-  const { identityScopeKey } = useAppConnection()
-  return <AppShellInner key={identityScopeKey}>{children}</AppShellInner>
+  const { identityScopeKey, serverMode } = useAppConnection()
+  return (
+    <AppShellInner key={identityScopeKey}>
+      <ConnectionScopedRouteContent serverMode={serverMode}>
+        {children}
+      </ConnectionScopedRouteContent>
+    </AppShellInner>
+  )
+}
+
+export function ConnectionScopedRouteContent({
+  children,
+  serverMode,
+}: {
+  children: React.ReactNode
+  serverMode: ServerMode
+}) {
+  return serverMode === 'checking' ? null : children
 }
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
@@ -381,7 +407,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     tooltip={t('footer.connection', { ns: 'appShell' })}
                     className="h-9"
                   >
-                    <PlugZapIcon />
+                    <CableIcon />
                     <span>{t('footer.connection', { ns: 'appShell' })}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
@@ -467,7 +493,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     })}
                     className="h-9"
                   >
-                    <PlugZapIcon />
+                    <BotIcon />
                     <span>
                       {t('footer.agentIntegrations', { ns: 'appShell' })}
                     </span>
@@ -490,7 +516,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             >
               <span
                 className={cn(
-                  'absolute h-8 min-w-10 rounded-xl bg-foreground shadow-sm transition-transform duration-200 ease-in-out',
+                  'absolute h-8 min-w-10 rounded-xl bg-background shadow-sm transition-transform duration-200 ease-in-out',
                   currentLanguage === 'en' && 'translate-x-full',
                 )}
               />
@@ -504,7 +530,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     aria-pressed={isActive}
                     className={cn(
                       'relative z-10 h-8 min-w-10 rounded-xl px-2 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
-                      isActive && 'text-background',
+                      isActive && 'text-foreground',
                     )}
                     onClick={() => {
                       if (!isActive) {
@@ -542,10 +568,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
             <div className="h-6 w-px bg-border/80" aria-hidden="true" />
 
-            <CurrentUserMenu
-              accountId={connection.accountId}
-              userId={connection.userId}
-            />
+            <CurrentUserMenu />
           </div>
         </header>
 

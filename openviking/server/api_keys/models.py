@@ -38,3 +38,5 @@ class AccountInfo:
 
     created_at: str
     users: Dict[str, dict] = field(default_factory=dict)
+    groups: Dict[str, dict] = field(default_factory=dict)
+    groups_loaded: bool = True

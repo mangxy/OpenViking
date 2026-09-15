@@ -74,6 +74,7 @@ import type {
 import { copyTextToClipboard } from '#/lib/clipboard'
 import { resolveStudioManagementCapabilities } from '#/lib/studio-permissions'
 
+import { UserMemoryPolicyCell } from './-components/user-memory-policy-cell'
 import { AddUserDialog } from './-components/add-user-dialog'
 import { DeleteAccountButton } from './-components/delete-account-button'
 import { getErrorMessage } from './-lib/error'
@@ -247,7 +248,7 @@ function UserManagementRoute() {
   }
 
   async function useUserIdentity(user: AdminUser | KeyResult): Promise<void> {
-    if (!user.apiKey) {
+    if (serverMode !== 'trusted' && !user.apiKey) {
       toast.error(t('management.noUsableKey'))
       return
     }
@@ -259,7 +260,7 @@ function UserManagementRoute() {
       await switchIdentity({
         accountId,
         allowLegacyIdentityFallback: true,
-        apiKey: user.apiKey,
+        apiKey: user.apiKey || '',
         userId,
       })
       toast.success(t('toast.dataKeySelected'))
@@ -336,7 +337,17 @@ function UserManagementRoute() {
           <Button
             type="button"
             variant="outline"
-            onClick={() => void usersQuery.refetch()}
+            onClick={() => {
+              void usersQuery.refetch()
+              void queryClient.invalidateQueries({
+                queryKey: [
+                  'user-memory-settings',
+                  adminConnection.baseUrl,
+                  adminConnection.apiKey,
+                  connection.accountId,
+                ],
+              })
+            }}
             disabled={usersQuery.isFetching}
           >
             <RefreshCwIcon
@@ -422,6 +433,7 @@ function UserManagementRoute() {
                   <TableRow className="bg-muted/20 hover:bg-muted/20">
                     <TableHead>{t('table.user')}</TableHead>
                     <TableHead>{t('table.role')}</TableHead>
+                    <TableHead>{t('memoryPolicy.title')}</TableHead>
                     <TableHead>{t('table.apiKey')}</TableHead>
                     <TableHead className="text-right">
                       {t('table.actions')}
@@ -434,6 +446,9 @@ function UserManagementRoute() {
                     const isCurrentIdentity =
                       user.accountId === connection.accountId &&
                       user.userId === connection.userId
+                    const canSwitchIdentity =
+                      !isCurrentIdentity &&
+                      (serverMode === 'trusted' || Boolean(user.apiKey))
                     const isSwitching = switchingIdentityKey === identityKey
                     const isLastManager =
                       (user.role === 'admin' || user.role === 'root') &&
@@ -517,6 +532,12 @@ function UserManagementRoute() {
                           )}
                         </TableCell>
                         <TableCell>
+                          <UserMemoryPolicyCell
+                            connection={adminConnection}
+                            user={user}
+                          />
+                        </TableCell>
+                        <TableCell>
                           <div className="flex min-w-0 items-center gap-1">
                             <code className="max-w-[20rem] truncate rounded-md border bg-muted/40 px-2 py-1 font-mono text-xs">
                               {resolveKeyLabel(user)}
@@ -571,7 +592,7 @@ function UserManagementRoute() {
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center justify-end gap-1">
-                            {user.apiKey && !isCurrentIdentity ? (
+                            {canSwitchIdentity ? (
                               <Button
                                 type="button"
                                 variant="secondary"

@@ -8,18 +8,41 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Container, Dict, List, Mapping, Optional
 
-from openviking.core.namespace import uri_parts, visible_roots
+from openviking.core.namespace import (
+    canonical_user_root,
+    resolve_uri,
+    uri_parts,
+    visible_roots,
+)
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.acl import (
+    ACL_CONTEXT_FIELDS,
+    ACL_MODE_FIELD,
+    AclAction,
+    AclManager,
+    AclMode,
+    acl_grant_tokens,
+    acl_principals,
+    is_acl_uri,
+)
 from openviking.storage.expr import And, Eq, FilterExpr, In, Or, PathScope, RawDSL
+from openviking.storage.vector_migration import (
+    rewrite_transfer_uri,
+    rewrite_vector_record,
+    uri_in_transfer_scope,
+)
 from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.collection.result import UpdateResult
 from openviking.storage.vectordb.utils.logging_init import init_cpp_logging
 from openviking.storage.vectordb_adapters import create_collection_adapter
 from openviking.utils.tags import merge_search_tags
+from openviking.utils.time_utils import get_current_timestamp
+from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME, VectorDBBackendConfig
+from openviking_cli.utils.uri import VikingURI
 
 logger = get_logger(__name__)
 
@@ -57,18 +80,6 @@ FETCH_BY_URI_OUTPUT_FIELDS = [
     "owner_user_id",
 ]
 
-URI_REWRITE_OUTPUT_FIELDS = [
-    "id",
-    "uri",
-    "level",
-    "name",
-    "description",
-    "tags",
-    "abstract",
-    "content",
-    "account_id",
-]
-
 VIKINGDB_CONTENT_MAX_SIZE = 1024 * 1024
 
 
@@ -76,6 +87,26 @@ VIKINGDB_CONTENT_MAX_SIZE = 1024 * 1024
 class UpsertOptions:
     partial_update: bool = False
     search_tag_mode: str = "replace"
+
+
+@dataclass
+class VectorTransferResult:
+    """Counts produced by one strict online vector URI transfer."""
+
+    scanned: int = 0
+    written: int = 0
+    deleted: int = 0
+    restored: int = 0
+    batches: int = 0
+
+
+class VectorTransferRollbackError(RuntimeError):
+    """Raised when a vector transfer and its compensation both fail."""
+
+    def __init__(self, message: str, *, phase: str, residual_count: int):
+        super().__init__(message)
+        self.phase = phase
+        self.residual_count = residual_count
 
 
 def normalize_upsert_options(
@@ -125,13 +156,48 @@ class _AsyncVectorAdapter:
     async def run(self, func: Any, /, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(func, *args, **kwargs)
 
-    async def collection_meta(self) -> Dict[str, Any]:
-        return await asyncio.to_thread(lambda: self._adapter.get_collection().get_meta_data() or {})
+    async def collection_meta(self, index_name: str) -> Dict[str, Any]:
+        def _get() -> Dict[str, Any]:
+            collection = self._adapter.get_collection()
+            meta = collection.get_meta_data() or {}
+            if self._adapter.mode in {"local", "cuvs"}:
+                index_meta = collection.get_index_meta_data(index_name) or {}
+                if "ScalarIndex" in index_meta:
+                    meta["ScalarIndex"] = index_meta["ScalarIndex"]
+            return meta
+
+        return await asyncio.to_thread(_get)
 
     async def update_collection_description(self, description: str) -> None:
         await asyncio.to_thread(
             lambda: self._adapter.get_collection().update(description=description)
         )
+
+    async def update_collection_schema(
+        self, fields: List[Dict[str, Any]], scalar_index: List[str], index_name: str
+    ) -> None:
+        def _update() -> None:
+            collection = self._adapter.get_collection()
+            existing_fields = {
+                field.get("FieldName") for field in collection.get_meta_data().get("Fields", [])
+            }
+            missing_fields = [
+                field for field in fields if field.get("FieldName") not in existing_fields
+            ]
+            if missing_fields:
+                collection.update(fields=missing_fields)
+
+            index_meta = collection.get_index_meta_data(index_name) or {}
+            current_scalar_index = index_meta.get("ScalarIndex", [])
+            indexed_fields = set(current_scalar_index)
+            missing_scalar_fields = [field for field in scalar_index if field not in indexed_fields]
+            if missing_scalar_fields:
+                collection.update_index(
+                    index_name,
+                    scalar_index=[*current_scalar_index, *missing_scalar_fields],
+                )
+
+        await asyncio.to_thread(_update)
 
 
 class _SingleAccountBackend:
@@ -252,7 +318,7 @@ class _SingleAccountBackend:
         return "not found" in message or "does not exist" in message
 
     async def _refresh_meta_data_async(self) -> None:
-        self._meta_data_cache = await self._async_adapter.collection_meta()
+        self._meta_data_cache = await self._async_adapter.collection_meta(self._index_name)
 
     # =========================================================================
     # Collection Management
@@ -318,7 +384,7 @@ class _SingleAccountBackend:
     async def get_collection_meta(self) -> Optional[Dict[str, Any]]:
         if not await self.collection_exists():
             return None
-        return await self._async_adapter.collection_meta()
+        return await self._async_adapter.collection_meta(self._index_name)
 
     async def update_collection_description(self, description: str) -> bool:
         if not await self.collection_exists():
@@ -326,6 +392,12 @@ class _SingleAccountBackend:
         await self._async_adapter.update_collection_description(description)
         await self._refresh_meta_data_async()
         return True
+
+    async def update_collection_schema(
+        self, fields: List[Dict[str, Any]], scalar_index: List[str]
+    ) -> None:
+        await self._async_adapter.update_collection_schema(fields, scalar_index, self._index_name)
+        await self._refresh_meta_data_async()
 
     # =========================================================================
     # Data Operations (with tenant enforcement)
@@ -474,6 +546,93 @@ class _SingleAccountBackend:
             logger.error("Error getting records: %s", e)
             return []
 
+    def _with_account_filter(
+        self, filter: Optional[Dict[str, Any] | FilterExpr]
+    ) -> Optional[FilterExpr]:
+        if not self._bound_account_id:
+            if isinstance(filter, dict):
+                return RawDSL(filter)
+            return filter
+        account_filter = Eq("account_id", self._bound_account_id)
+        if not filter:
+            return account_filter
+        if isinstance(filter, dict):
+            filter = RawDSL(filter)
+        return And([account_filter, filter])
+
+    async def get_strict(self, ids: List[str]) -> List[Dict[str, Any]]:
+        """Fetch records without converting backend errors to misses."""
+        records = await self._async_adapter.call("get", ids)
+        if self._bound_account_id:
+            records = [r for r in records if r.get("account_id") == self._bound_account_id]
+        return records
+
+    async def strict_get(self, ids: List[str]) -> List[Dict[str, Any]]:
+        """Transaction alias for strict record reads."""
+        return await self.get_strict(ids)
+
+    async def strict_delete(self, ids: List[str]) -> int:
+        """Delete transaction records and propagate every backend failure."""
+        if self._bound_account_id:
+            records = await self.strict_get(ids)
+            valid_ids = [str(record["id"]) for record in records if record.get("id")]
+            ids = valid_ids
+        if not ids:
+            return 0
+        return int(await self._async_adapter.call("delete", ids=ids) or 0)
+
+    async def strict_query(
+        self,
+        *,
+        filter: Optional[Dict[str, Any] | FilterExpr] = None,
+        limit: int = 10,
+        offset: int = 0,
+        output_fields: Optional[List[str]] = None,
+        order_by: Optional[str] = None,
+        order_desc: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Query transaction records without fail-open exception handling."""
+        return await self._async_adapter.call(
+            "query",
+            query_vector=None,
+            sparse_query_vector=None,
+            filter=self._with_account_filter(filter),
+            limit=limit,
+            offset=offset,
+            output_fields=output_fields,
+            order_by=order_by,
+            order_desc=order_desc,
+        )
+
+    async def strict_scroll(
+        self,
+        filter: Optional[Dict[str, Any] | FilterExpr] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+        output_fields: Optional[List[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """Return a stable URI-ordered page for a transactional scan."""
+        offset = int(cursor) if cursor else 0
+        records = await self.strict_query(
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            output_fields=output_fields,
+            # The local engine's scalar sorter does not return records for
+            # path/string fields. ``updated_at`` is an indexed date-time field
+            # on every context collection and provides stable offset pages.
+            order_by="updated_at",
+            order_desc=False,
+        )
+        next_cursor = str(offset + len(records)) if len(records) == limit else None
+        return records, next_cursor
+
+    async def strict_count(self, filter: Optional[Dict[str, Any] | FilterExpr] = None) -> int:
+        """Count transaction records without converting backend errors to zero."""
+        return int(
+            await self._async_adapter.call("count", filter=self._with_account_filter(filter)) or 0
+        )
+
     async def delete(self, ids: List[str]) -> int:
         try:
             if self._bound_account_id:
@@ -608,7 +767,7 @@ class _SingleAccountBackend:
             if any(r.get("level") in [0, 1] for r in target_records):
                 total_deleted += await self._remove_descendants(parent_uri=uri)
 
-            ids = [r.get("id") for r in target_records if r.get("id")]
+            ids = [str(r["id"]) for r in target_records if r.get("id")]
             if ids:
                 total_deleted += await self.delete(ids)
             return total_deleted
@@ -641,9 +800,17 @@ class _SingleAccountBackend:
         cursor: Optional[str] = None,
         output_fields: Optional[List[str]] = None,
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """Scroll records without converting backend failures into an empty page."""
+        if isinstance(filter, dict):
+            filter = RawDSL(filter)
+        if self._bound_account_id:
+            account_filter = Eq("account_id", self._bound_account_id)
+            filter = And([account_filter, filter]) if filter else account_filter
+
         offset = int(cursor) if cursor else 0
-        records = await self.filter(
-            filter=filter or {},
+        records = await self._async_adapter.call(
+            "query",
+            filter=filter,
             limit=limit,
             offset=offset,
             output_fields=output_fields,
@@ -771,6 +938,7 @@ class VikingVectorIndexBackend:
         self.sparse_weight = config.sparse_weight
         self._collection_name = config.name or "context"
         self._index_name = config.index_name or DEFAULT_INDEX_NAME
+        self.acl_manager: Optional[AclManager] = None
 
         self._account_backends: Dict[str, _SingleAccountBackend] = {}
         self._root_backend: Optional[_SingleAccountBackend] = None
@@ -869,6 +1037,15 @@ class VikingVectorIndexBackend:
     async def update_collection_description(self, description: str) -> bool:
         return await self._get_default_backend().update_collection_description(description)
 
+    async def update_collection_schema(
+        self, fields: List[Dict[str, Any]], scalar_index: List[str]
+    ) -> None:
+        default_backend = self._get_default_backend()
+        await default_backend.update_collection_schema(fields, scalar_index)
+        for backend in [*self._account_backends.values(), self._root_backend]:
+            if backend is not None and backend is not default_backend:
+                await backend._refresh_meta_data_async()
+
     # =========================================================================
     # 公开数据操作 API（强制要求 ctx）
     # =========================================================================
@@ -894,6 +1071,8 @@ class VikingVectorIndexBackend:
             options.partial_update,
             options.search_tag_mode,
         )
+        data = {key: value for key, value in data.items() if key not in ACL_CONTEXT_FIELDS}
+        data = (await self._materialize_acl_fields([data], ctx))[0]
         backend = self._get_backend_for_context(ctx)
         logger.debug(
             "[VikingVectorIndexBackend.upsert] Using backend for account_id=%s",
@@ -929,13 +1108,45 @@ class VikingVectorIndexBackend:
             ctx.account_id,
             len(data_list),
         )
-        backend = self._get_backend_for_context(ctx)
-        result = await backend.upsert_many(data_list)
+        data_list = [
+            {key: value for key, value in record.items() if key not in ACL_CONTEXT_FIELDS}
+            for record in data_list
+        ]
+        data_list = await self._materialize_acl_fields(data_list, ctx)
+        result = await self._upsert_many_raw(data_list, ctx=ctx)
         logger.debug(
             "[VikingVectorIndexBackend.upsert_many] Completed with count=%s, result_count=%s",
             len(data_list),
             len(result),
         )
+        return result
+
+    async def _upsert_many_raw(
+        self, data_list: List[Dict[str, Any]], *, ctx: RequestContext
+    ) -> List[str]:
+        """Write records whose ACL fields have already been materialized."""
+        return await self._get_backend_for_context(ctx).upsert_many(data_list)
+
+    async def _materialize_acl_fields(
+        self, records: List[Dict[str, Any]], ctx: RequestContext
+    ) -> List[Dict[str, Any]]:
+        if not self.acl_manager or not records:
+            return records
+        return await self.acl_manager.materialize_context_records(records, ctx)
+
+    async def update(self, data: Dict[str, Any], *, ctx: RequestContext) -> UpdateResult:
+        """Strict update path. The target record must already exist."""
+        data = {key: value for key, value in data.items() if key not in ACL_CONTEXT_FIELDS}
+        logger.debug(
+            "[VikingVectorIndexBackend.update] uri=%s",
+            data.get("uri", ""),
+        )
+        backend = self._get_backend_for_context(ctx)
+        logger.debug(
+            f"[VikingVectorIndexBackend.update] Using backend for account_id={ctx.account_id}"
+        )
+        result = await backend.update(data)
+        logger.debug(f"[VikingVectorIndexBackend.update] Completed, result={result}")
         return result
 
     @asynccontextmanager
@@ -968,20 +1179,12 @@ class VikingVectorIndexBackend:
             if exit_cancellation is not None:
                 raise exit_cancellation
 
-    async def update(self, data: Dict[str, Any], *, ctx: RequestContext) -> UpdateResult:
-        """Strict update path. The target record must already exist."""
-        logger.debug("[VikingVectorIndexBackend.update] uri=%s", data.get("uri", ""))
-        backend = self._get_backend_for_context(ctx)
-        logger.debug(
-            f"[VikingVectorIndexBackend.update] Using backend for account_id={ctx.account_id}"
-        )
-        result = await backend.update(data)
-        logger.debug(f"[VikingVectorIndexBackend.update] Completed, result={result}")
-        return result
-
     async def get(self, ids: List[str], *, ctx: RequestContext) -> List[Dict[str, Any]]:
         backend = self._get_backend_for_context(ctx)
         return await backend.get(ids)
+
+    async def get_strict(self, ids: List[str], *, ctx: RequestContext) -> List[Dict[str, Any]]:
+        return await self._get_backend_for_context(ctx).get_strict(ids)
 
     async def delete(self, ids: List[str], *, ctx: RequestContext) -> int:
         backend = self._get_backend_for_context(ctx)
@@ -1192,6 +1395,37 @@ class VikingVectorIndexBackend:
             output_fields=output_fields,
         )
 
+    async def _strict_transfer_page(
+        self,
+        ctx: RequestContext,
+        filter: FilterExpr,
+        *,
+        limit: int,
+        cursor: Optional[str],
+        output_fields: List[str],
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        backend = self._get_backend_for_context(ctx)
+        return await backend.strict_scroll(
+            filter=filter,
+            limit=limit,
+            cursor=cursor,
+            output_fields=output_fields,
+        )
+
+    async def _strict_transfer_count(self, ctx: RequestContext, filter: FilterExpr) -> int:
+        backend = self._get_backend_for_context(ctx)
+        return await backend.strict_count(filter=filter)
+
+    async def _strict_transfer_get(
+        self, ctx: RequestContext, ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        backend = self._get_backend_for_context(ctx)
+        return await backend.strict_get(ids)
+
+    async def _strict_transfer_delete(self, ctx: RequestContext, ids: List[str]) -> int:
+        backend = self._get_backend_for_context(ctx)
+        return await backend.strict_delete(ids)
+
     async def count(
         self,
         filter: Optional[Dict[str, Any] | FilterExpr] = None,
@@ -1217,6 +1451,7 @@ class VikingVectorIndexBackend:
     ) -> List[Dict[str, Any]]:
         if ctx:
             backend = self._get_backend_for_context(ctx)
+            filter = self._merge_filters(filter, self._tenant_filter(ctx))
         else:
             backend = self._get_default_backend()
         return await backend.search_by_keywords(
@@ -1300,6 +1535,43 @@ class VikingVectorIndexBackend:
             ctx=ctx,
         )
 
+    async def filter_in_tenant(
+        self,
+        ctx: RequestContext,
+        context_type: Optional[str] = None,
+        target_directories: Optional[List[str]] = None,
+        extra_filter: Optional[FilterExpr | Dict[str, Any]] = None,
+        level: Optional[List[int]] = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Metadata-only lookup scoped exactly like search_in_tenant.
+
+        Used when a caller supplies a filter but no query, so there is no vector
+        to search by. Scoping goes through the same _build_scope_filter as the
+        vector path, which keeps tenant isolation and target-directory limits
+        identical between the two — a separately hand-built filter would be one
+        refactor away from silently losing them.
+        """
+        scope_filter = self._build_scope_filter(
+            ctx=ctx,
+            context_type=context_type,
+            target_directories=target_directories,
+            extra_filter=extra_filter,
+            level=level,
+        )
+        if scope_filter is None:
+            raise InvalidArgumentError(
+                "A query-less lookup needs a filter or a target directory to scope by."
+            )
+        return await self.filter(
+            filter=scope_filter,
+            limit=limit,
+            offset=offset,
+            output_fields=RETRIEVAL_OUTPUT_FIELDS,
+            ctx=ctx,
+        )
+
     async def search_children_in_tenant(
         self,
         ctx: RequestContext,
@@ -1368,6 +1640,46 @@ class VikingVectorIndexBackend:
             output_fields=LOOKUP_OUTPUT_FIELDS,
         )
 
+    async def get_l2_abstracts_by_uris(
+        self,
+        uris: List[str],
+        *,
+        ctx: RequestContext,
+    ) -> Dict[str, str]:
+        """Strictly load existing L2 abstracts for a bounded URI set."""
+        requested_by_canonical: Dict[str, str] = {}
+        for uri in uris:
+            requested_by_canonical.setdefault(resolve_uri(uri).uri, uri)
+        canonical_uris = list(requested_by_canonical)
+        if not canonical_uris:
+            return {}
+
+        abstracts: Dict[str, str] = {}
+        chunk_size = 100
+        for start in range(0, len(canonical_uris), chunk_size):
+            chunk = canonical_uris[start : start + chunk_size]
+            cursor: Optional[str] = None
+            while True:
+                records, cursor = await self._strict_transfer_page(
+                    ctx,
+                    And([In("uri", chunk), Eq("level", 2)]),
+                    limit=100,
+                    cursor=cursor,
+                    output_fields=["uri", "abstract", "updated_at"],
+                )
+                for record in records:
+                    uri = str(record.get("uri") or "")
+                    abstract = str(record.get("abstract") or "").strip()
+                    if uri and abstract and uri not in abstracts:
+                        abstracts[uri] = abstract
+                if cursor is None:
+                    break
+        return {
+            requested_by_canonical[uri]: abstract
+            for uri, abstract in abstracts.items()
+            if uri in requested_by_canonical
+        }
+
     async def delete_account_data(self, account_id: str, *, ctx: RequestContext) -> int:
         """删除指定 account 的所有数据（仅限，root 角色操作）"""
         self._check_root_role(ctx)
@@ -1398,96 +1710,462 @@ class VikingVectorIndexBackend:
             backend = self._get_backend_for_context(ctx)
             await backend.delete_by_filter(And(conds))
 
-    async def update_uri_mapping(
+    def _uri_transfer_filter(self, ctx: RequestContext, uri: str, *, recursive: bool) -> FilterExpr:
+        scopes: List[FilterExpr] = [Eq("uri", uri)]
+        if recursive:
+            scopes.append(PathScope("uri", uri, depth=-1))
+        # Chunk URIs are siblings in the path index. Scan one parent level and
+        # filter exact transfer entries below, without backend-specific operators.
+        parent = VikingURI(uri).parent
+        if parent is not None and parent.uri != "viking://":
+            scopes.append(PathScope("uri", parent.uri, depth=1))
+        return And([Eq("account_id", ctx.account_id), Or(scopes)])
+
+    async def _scan_uri_transfer_scope(
         self,
         ctx: RequestContext,
         uri: str,
-        new_uri: str,
-        levels: Optional[List[int]] = None,
-    ) -> bool:
-        import hashlib
-
-        conds: List[FilterExpr] = [Eq("uri", uri), Eq("account_id", ctx.account_id)]
-        if levels:
-            conds.append(In("level", levels))
-
-        records = await self.filter(
-            filter=And(conds),
-            limit=100,
-            output_fields=URI_REWRITE_OUTPUT_FIELDS,
-            ctx=ctx,
-        )
-        if not records:
-            return False
-        record_ids = [str(record["id"]) for record in records if record.get("id")]
-        if not record_ids:
-            logger.warning(
-                "update_uri_mapping found records without ids: uri=%s new_uri=%s account_id=%s",
-                uri,
-                new_uri,
-                ctx.account_id,
+        *,
+        recursive: bool,
+        include_full_records: bool,
+        batch_size: int = 100,
+        entry_uris: List[str] | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Scan one URI scope without a fixed total-record limit."""
+        selected_entries = set(entry_uris) if entry_uris is not None else None
+        if selected_entries is not None:
+            if not selected_entries:
+                return [], 0
+            filters = [
+                self._uri_transfer_filter(ctx, entry, recursive=False)
+                for entry in sorted(selected_entries)
+            ]
+            transfer_filter = filters[0] if len(filters) == 1 else Or(filters)
+        else:
+            transfer_filter = self._uri_transfer_filter(ctx, uri, recursive=recursive)
+        expected_count = await self._strict_transfer_count(ctx, transfer_filter)
+        records: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        batches = 0
+        seen_cursors: set[str] = set()
+        seen_ids: set[str] = set()
+        scanned_count = 0
+        while True:
+            page, next_cursor = await self._strict_transfer_page(
+                ctx,
+                transfer_filter,
+                limit=batch_size,
+                cursor=cursor,
+                output_fields=["id", "uri"],
             )
-            return False
-        full_records = await self.get(record_ids, ctx=ctx)
-        if not full_records:
-            logger.warning(
-                "update_uri_mapping failed to fetch full records: uri=%s new_uri=%s account_id=%s ids=%s",
-                uri,
-                new_uri,
-                ctx.account_id,
-                record_ids,
-            )
-            return False
-
-        def _seed_uri_for_id(uri: str, level: int) -> str:
-            if level == 0:
-                return uri if uri.endswith("/.abstract.md") else f"{uri}/.abstract.md"
-            if level == 1:
-                return uri if uri.endswith("/.overview.md") else f"{uri}/.overview.md"
-            return uri
-
-        success = False
-        ids_to_delete: List[str] = []
-        for record in full_records:
-            if "id" not in record:
-                continue
-            raw_level = record.get("level", 2)
-            try:
-                level = int(raw_level)
-            except (TypeError, ValueError):
-                level = 2
-
-            seed_uri = _seed_uri_for_id(new_uri, level)
-            id_seed = f"{ctx.account_id}:{seed_uri}"
-            new_id = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
-
-            updated = {
-                **record,
-                "id": new_id,
-                "uri": new_uri,
-            }
-            vector = updated.get("vector")
-            if not vector:
-                logger.warning(
-                    "update_uri_mapping skipped record without dense vector: old_uri=%s new_uri=%s level=%s account_id=%s id=%s",
-                    uri,
-                    new_uri,
-                    level,
-                    ctx.account_id,
-                    record.get("id"),
+            batches += 1
+            if not page and scanned_count < expected_count:
+                raise RuntimeError(
+                    f"Vector scan ended after {scanned_count} of {expected_count} records under {uri}"
                 )
-                continue
-            result = await self.upsert(updated, ctx=ctx)
-            if result:
-                success = True
-                old_id = record.get("id")
-                if old_id and old_id != new_id:
-                    ids_to_delete.append(old_id)
+            scanned_count += len(page)
+            for record in page:
+                record_id = record.get("id")
+                if not record_id:
+                    raise RuntimeError(f"Vector records without IDs found under {uri}")
+                normalized_id = str(record_id)
+                if normalized_id in seen_ids:
+                    raise RuntimeError(
+                        f"Vector scan returned duplicate vector record {normalized_id} under {uri}"
+                    )
+                seen_ids.add(normalized_id)
+            scoped = [
+                record
+                for record in page
+                if isinstance(record.get("uri"), str)
+                and (
+                    self._vector_entry_uri(record["uri"], selected_entries) in selected_entries
+                    if selected_entries is not None
+                    else uri_in_transfer_scope(record["uri"], uri, recursive=recursive)
+                )
+            ]
+            if include_full_records and scoped:
+                ids = [str(record["id"]) for record in scoped if record.get("id")]
+                if len(ids) != len(scoped):
+                    raise RuntimeError(f"Vector records without IDs found under {uri}")
+                full_records = await self._strict_transfer_get(ctx, ids)
+                by_id = {str(record["id"]): record for record in full_records if record.get("id")}
+                if len(by_id) != len(ids):
+                    raise RuntimeError(f"Failed to fetch complete vector records under {uri}")
+                records.extend(by_id[record_id] for record_id in ids)
+            else:
+                records.extend(scoped)
 
-        if ids_to_delete:
-            await self.delete(list(set(ids_to_delete)), ctx=ctx)
+            if scanned_count == expected_count:
+                break
+            if scanned_count > expected_count:
+                raise RuntimeError(
+                    f"Vector scan returned {scanned_count} records but count was {expected_count} "
+                    f"under {uri}"
+                )
+            if next_cursor is None:
+                raise RuntimeError(
+                    f"Vector scan cursor ended after {scanned_count} of {expected_count} records "
+                    f"under {uri}"
+                )
+            if next_cursor in seen_cursors:
+                raise RuntimeError(f"Vector scroll cursor repeated under {uri}: {next_cursor}")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return records, batches
 
-        return success
+    async def _delete_vector_transfer_ids(
+        self,
+        ctx: RequestContext,
+        ids: List[str],
+        *,
+        batch_size: int = 100,
+    ) -> int:
+        deleted = 0
+        for offset in range(0, len(ids), batch_size):
+            batch = ids[offset : offset + batch_size]
+            batch_deleted = await self._strict_transfer_delete(ctx, batch)
+            residual = await self._strict_transfer_get(ctx, batch)
+            if residual:
+                raise RuntimeError(
+                    f"Vector cleanup deleted {batch_deleted} of {len(batch)} records and left "
+                    f"{len(residual)} records"
+                )
+            if batch_deleted != len(batch):
+                logger.info(
+                    "Vector cleanup removed %s of %s attempted IDs; remaining IDs were never written",
+                    batch_deleted,
+                    len(batch),
+                )
+            deleted += batch_deleted
+        return deleted
+
+    @staticmethod
+    def _vector_entry_uri(uri: str, known_uris: Container[str] = ()) -> str:
+        """Prefer real entry URIs; only strip a trailing chunk identifier."""
+        if uri in known_uris:
+            return uri
+        base, marker, suffix = uri.rpartition("#")
+        if marker and "/" not in suffix and suffix.startswith(("chunk_", "chunk-")):
+            return base
+        return uri
+
+    @staticmethod
+    def _validate_uri_transfer_scopes(source_uri: str, target_uri: str) -> None:
+        if uri_in_transfer_scope(target_uri, source_uri, recursive=True) or uri_in_transfer_scope(
+            source_uri, target_uri, recursive=True
+        ):
+            raise InvalidArgumentError(
+                "source and target vector scopes must not be equal or contain one another"
+            )
+
+    async def _prepare_uri_transfer(
+        self,
+        ctx: RequestContext,
+        source_uri: str,
+        target_uri: str,
+        *,
+        recursive: bool,
+        source_uris: List[str] | None,
+        preserve_target_acl: bool = False,
+        target_entry_exists: Callable[[str], Awaitable[bool]] | None = None,
+    ) -> tuple[List[Dict[str, Any]], int, Dict[str, Dict[str, Any]]]:
+        """Read selected source records and remove affected target records."""
+        source_records, batches = await self._scan_uri_transfer_scope(
+            ctx,
+            source_uri,
+            recursive=recursive,
+            include_full_records=True,
+        )
+
+        selected_source_uris = {
+            resolve_uri(uri).uri
+            for uri in (source_uris if source_uris is not None else [source_uri])
+        }
+        if source_uris is not None:
+            source_records = [
+                record
+                for record in source_records
+                if self._vector_entry_uri(str(record["uri"]), selected_source_uris)
+                in selected_source_uris
+            ]
+
+        # Match legacy mv: unindexed source entries leave old target records intact.
+        if not source_records:
+            return source_records, batches, {}
+        replacement_source_uris = {
+            self._vector_entry_uri(str(record["uri"]), selected_source_uris)
+            for record in source_records
+        }
+        replacement_target_uris = {
+            rewrite_transfer_uri(uri, source_uri, target_uri) for uri in replacement_source_uris
+        }
+        if any(
+            not uri_in_transfer_scope(uri, target_uri, recursive=recursive)
+            for uri in replacement_target_uris
+        ):
+            raise InvalidArgumentError("replacement entry is outside the target vector scope")
+        # URI spelling alone cannot distinguish a chunk from a real file whose
+        # name ends in #chunk_*. Ask the filesystem only for ambiguous candidates.
+        independent_targets: Dict[str, bool] = {}
+
+        async def is_independent_target(uri: str) -> bool:
+            if target_entry_exists is None or uri in replacement_target_uris:
+                return False
+            if self._vector_entry_uri(uri, replacement_target_uris) == uri:
+                return False
+            if uri not in independent_targets:
+                independent_targets[uri] = await target_entry_exists(uri)
+            return independent_targets[uri]
+
+        for record in source_records:
+            written_uri = rewrite_transfer_uri(str(record["uri"]), source_uri, target_uri)
+            if await is_independent_target(written_uri):
+                raise InvalidArgumentError(
+                    f"vector chunk conflicts with an existing filesystem entry: {written_uri}"
+                )
+        # A chunk cannot carry ACL for its base file URI. Keep the old main record
+        # when copy has no main record to replace it, accepting its stale content.
+        preserved_acl_uris: set[str] = set()
+        if preserve_target_acl and self._acl_enabled(ctx):
+            written_uris = {
+                rewrite_transfer_uri(str(record["uri"]), source_uri, target_uri)
+                for record in source_records
+            }
+            preserved_acl_uris = {
+                uri for uri in replacement_target_uris - written_uris if is_acl_uri(uri)
+            }
+        # Bound the query expression and avoid scanning destination-only subtrees.
+        target_entries = sorted(replacement_target_uris)
+        affected_target_ids: List[str] = []
+        for offset in range(0, len(target_entries), 100):
+            target_records, _ = await self._scan_uri_transfer_scope(
+                ctx,
+                target_uri,
+                recursive=False,
+                include_full_records=False,
+                entry_uris=target_entries[offset : offset + 100],
+            )
+            for record in target_records:
+                if record["uri"] not in preserved_acl_uris and not await is_independent_target(
+                    str(record["uri"])
+                ):
+                    affected_target_ids.append(str(record["id"]))
+        target_acl_fields: Dict[str, Dict[str, Any]] = {}
+        if preserve_target_acl and self._acl_enabled(ctx) and replacement_target_uris:
+            assert self.acl_manager is not None
+            acl_target_uris = {uri for uri in replacement_target_uris if is_acl_uri(uri)}
+            target_acl_fields = {
+                uri: effective.context_fields()
+                for uri, effective in (
+                    await self.acl_manager.resolve_many(acl_target_uris, ctx)
+                ).items()
+            }
+        if affected_target_ids:
+            await self._delete_vector_transfer_ids(ctx, affected_target_ids)
+        return source_records, batches, target_acl_fields
+
+    async def copy_uri_mapping(
+        self,
+        ctx: RequestContext,
+        source_uri: str,
+        target_uri: str,
+        recursive: bool = False,
+        *,
+        source_uris: List[str] | None = None,
+        target_entry_exists: Callable[[str], Awaitable[bool]] | None = None,
+    ) -> VectorTransferResult:
+        """Copy every vector record in a URI scope without regenerating embeddings."""
+        source_uri = resolve_uri(source_uri).uri
+        target_uri = resolve_uri(target_uri).uri
+        self._validate_uri_transfer_scopes(source_uri, target_uri)
+        source_records, batches, target_acl_fields = await self._prepare_uri_transfer(
+            ctx,
+            source_uri,
+            target_uri,
+            recursive=recursive,
+            source_uris=source_uris,
+            target_entry_exists=target_entry_exists,
+            preserve_target_acl=True,
+        )
+        result = VectorTransferResult(scanned=len(source_records), batches=batches)
+        timestamp = get_current_timestamp()
+        target_payloads = [
+            rewrite_vector_record(
+                record,
+                source_uri=source_uri,
+                target_uri=target_uri,
+                ctx=ctx,
+                mode="copy",
+                timestamp=timestamp,
+            )
+            for record in source_records
+        ]
+        if target_acl_fields:
+            for payload in target_payloads:
+                acl_fields = target_acl_fields.get(
+                    self._vector_entry_uri(str(payload["uri"]), target_acl_fields)
+                )
+                if acl_fields is not None:
+                    payload.update(acl_fields)
+
+        if not target_payloads:
+            return result
+
+        attempted_target_ids: List[str] = []
+        try:
+            for offset in range(0, len(target_payloads), 100):
+                payload_batch = target_payloads[offset : offset + 100]
+                attempted_target_ids.extend(str(payload["id"]) for payload in payload_batch)
+                written_ids = (
+                    await self._upsert_many_raw(payload_batch, ctx=ctx)
+                    if target_acl_fields
+                    else await self.upsert_many(payload_batch, ctx=ctx)
+                )
+                if len(written_ids) != len(payload_batch):
+                    raise RuntimeError(
+                        f"Vector copy wrote {len(written_ids)} of {len(payload_batch)} records"
+                    )
+                result.written += len(written_ids)
+        except Exception as transfer_error:
+            try:
+                await self._delete_vector_transfer_ids(ctx, attempted_target_ids)
+            except Exception as rollback_error:
+                diagnostic_suffix = ""
+                try:
+                    residual_count = len(await self._strict_transfer_get(ctx, attempted_target_ids))
+                except Exception as diagnostic_error:
+                    residual_count = len(attempted_target_ids)
+                    diagnostic_suffix = f"; residual scan failed: {diagnostic_error}"
+                raise VectorTransferRollbackError(
+                    f"Vector copy failed and target cleanup failed: {rollback_error}"
+                    f"{diagnostic_suffix}",
+                    phase="copy_target_cleanup",
+                    residual_count=residual_count,
+                ) from transfer_error
+            raise
+        return result
+
+    async def update_uri_mapping(
+        self,
+        ctx: RequestContext,
+        source_uri: str,
+        target_uri: str,
+        recursive: bool = False,
+        *,
+        source_uris: List[str] | None = None,
+        target_entry_exists: Callable[[str], Awaitable[bool]] | None = None,
+    ) -> VectorTransferResult:
+        """Move every vector record in a URI scope with compensating rollback."""
+        source_uri = resolve_uri(source_uri).uri
+        target_uri = resolve_uri(target_uri).uri
+        self._validate_uri_transfer_scopes(source_uri, target_uri)
+        source_records, batches, _ = await self._prepare_uri_transfer(
+            ctx,
+            source_uri,
+            target_uri,
+            recursive=recursive,
+            source_uris=source_uris,
+            target_entry_exists=target_entry_exists,
+        )
+        result = VectorTransferResult(scanned=len(source_records), batches=batches)
+        if not source_records:
+            return result
+
+        timestamp = get_current_timestamp()
+        acl_enabled = self._acl_enabled(ctx)
+        moved_acl_by_uri: Dict[str, Dict[str, Any]] = {}
+        target_payloads: List[Dict[str, Any]] = []
+        for record in source_records:
+            payload = rewrite_vector_record(
+                record,
+                source_uri=source_uri,
+                target_uri=target_uri,
+                ctx=ctx,
+                mode="move",
+                timestamp=timestamp,
+            )
+            if acl_enabled:
+                assert self.acl_manager is not None
+                rewritten_uri = str(payload["uri"])
+                acl_fields = moved_acl_by_uri.get(rewritten_uri)
+                if acl_fields is None:
+                    acl_fields = await self.acl_manager.materialize_moved_record(
+                        record,
+                        rewritten_uri,
+                        ctx,
+                    )
+                    moved_acl_by_uri[rewritten_uri] = acl_fields
+                payload.update(acl_fields)
+            target_payloads.append(payload)
+        target_ids = [str(payload["id"]) for payload in target_payloads]
+        attempted_target_ids: List[str] = []
+        try:
+            for offset in range(0, len(target_payloads), 100):
+                payload_batch = target_payloads[offset : offset + 100]
+                attempted_target_ids.extend(str(payload["id"]) for payload in payload_batch)
+                written_ids = (
+                    await self._upsert_many_raw(payload_batch, ctx=ctx)
+                    if acl_enabled
+                    else await self.upsert_many(payload_batch, ctx=ctx)
+                )
+                if len(written_ids) != len(payload_batch):
+                    raise RuntimeError(
+                        f"Vector move wrote {len(written_ids)} of {len(payload_batch)} records"
+                    )
+                result.written += len(written_ids)
+        except Exception as transfer_error:
+            try:
+                await self._delete_vector_transfer_ids(ctx, attempted_target_ids)
+            except Exception as rollback_error:
+                diagnostic_suffix = ""
+                try:
+                    residual_count = len(await self._strict_transfer_get(ctx, attempted_target_ids))
+                except Exception as diagnostic_error:
+                    residual_count = len(attempted_target_ids)
+                    diagnostic_suffix = f"; residual scan failed: {diagnostic_error}"
+                raise VectorTransferRollbackError(
+                    f"Vector move prepare failed and target cleanup failed: {rollback_error}"
+                    f"{diagnostic_suffix}",
+                    phase="move_target_cleanup",
+                    residual_count=residual_count,
+                ) from transfer_error
+            raise
+
+        source_ids = [str(record["id"]) for record in source_records]
+        try:
+            for offset in range(0, len(source_ids), 100):
+                source_batch = source_ids[offset : offset + 100]
+                deleted = await self._strict_transfer_delete(ctx, source_batch)
+                if deleted != len(source_batch):
+                    raise RuntimeError(
+                        f"Vector move deleted {deleted} of {len(source_batch)} source records"
+                    )
+                result.deleted += deleted
+        except Exception as transfer_error:
+            rollback_errors: List[Exception] = []
+            try:
+                restored_ids = await self._upsert_many_raw(source_records, ctx=ctx)
+                result.restored = len(restored_ids)
+                if result.restored != len(source_records):
+                    raise RuntimeError(
+                        f"Vector move restored {result.restored} of {len(source_records)} records"
+                    )
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+            try:
+                await self._delete_vector_transfer_ids(ctx, target_ids)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+            if rollback_errors:
+                raise VectorTransferRollbackError(
+                    "Vector move source deletion failed and compensation was incomplete: "
+                    + "; ".join(str(error) for error in rollback_errors),
+                    phase="move_source_restore",
+                    residual_count=len(source_records),
+                ) from transfer_error
+            raise
+        return result
 
     async def increment_active_count(self, ctx: RequestContext, uris: List[str]) -> int:
         updated = 0
@@ -1523,8 +2201,12 @@ class VikingVectorIndexBackend:
             filters.append(Eq("context_type", context_type))
 
         targets = [target_dir for target_dir in target_directories or [] if target_dir]
-        tenant_filter = self._tenant_filter(ctx, context_type=context_type)
-        if tenant_filter and self._targets_within_visible_roots(ctx, targets):
+        tenant_filter = self._tenant_filter(ctx)
+        if (
+            tenant_filter
+            and not self._acl_enabled(ctx)
+            and self._targets_within_visible_roots(ctx, targets)
+        ):
             # The target scopes are already narrower than the tenant-visible
             # roots. Keep account isolation, but avoid recursively evaluating
             # the broader path scopes as an additional filter.
@@ -1562,18 +2244,64 @@ class VikingVectorIndexBackend:
             for target_parts in (tuple(uri_parts(target)) for target in targets)
         )
 
-    @staticmethod
-    def _tenant_filter(
-        ctx: RequestContext, context_type: Optional[str] = None
-    ) -> Optional[FilterExpr]:
+    def _tenant_filter(self, ctx: RequestContext) -> Optional[FilterExpr]:
+        if ctx.bypass_acl:
+            return Eq("account_id", ctx.account_id)
         if ctx.role == Role.ROOT:
             return None
 
         account_filter = Eq("account_id", ctx.account_id)
-        path_filter = Or([PathScope("uri", root, depth=-1) for root in visible_roots(ctx)])
-        if context_type:
-            return And([account_filter, path_filter])
-        return And([account_filter, path_filter])
+        if not self._acl_enabled(ctx):
+            return And(
+                [
+                    account_filter,
+                    Or([PathScope("uri", root, depth=-1) for root in visible_roots(ctx)]),
+                ]
+            )
+
+        controlled_modes = [AclMode.INHERIT.value, AclMode.RESTRICTED.value]
+        uncontrolled_filter = And(
+            [
+                RawDSL(
+                    {
+                        "op": "must_not",
+                        "field": ACL_MODE_FIELD,
+                        # Exclude controlled modes so absent/null fields stay visible.
+                        "conds": controlled_modes,
+                    }
+                ),
+                Or([PathScope("uri", root, depth=-1) for root in visible_roots(ctx)]),
+            ]
+        )
+        read_grants = acl_grant_tokens(acl_principals(ctx), AclAction.READ)
+        shared_acl_filter = And(
+            [
+                PathScope("uri", "viking://resources", depth=-1),
+                In(ACL_MODE_FIELD, controlled_modes),
+                Or(
+                    [
+                        In("acl_direct_grants", read_grants),
+                        And(
+                            [
+                                Eq(ACL_MODE_FIELD, AclMode.INHERIT.value),
+                                In("acl_inherited_grants", read_grants),
+                            ]
+                        ),
+                    ]
+                ),
+            ]
+        )
+        access_filters: List[FilterExpr] = [
+            uncontrolled_filter,
+            shared_acl_filter,
+            PathScope("uri", f"{canonical_user_root(ctx)}/resources", depth=-1),
+        ]
+        if ctx.role == Role.ADMIN:
+            access_filters.append(PathScope("uri", "viking://resources", depth=-1))
+        return And([account_filter, Or(access_filters)])
+
+    def _acl_enabled(self, ctx: RequestContext) -> bool:
+        return self.acl_manager is not None and self.acl_manager.is_enabled(ctx.account_id)
 
     @staticmethod
     def _merge_filters(*filters: Optional[FilterExpr]) -> Optional[FilterExpr]:

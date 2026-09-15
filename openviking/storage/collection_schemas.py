@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from openviking.core.context import ContextType, ResourceContentType
 from openviking.models.embedder.base import embed_compat
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.acl import ACL_GRANT_FIELDS, ACL_MODE_FIELD, AclMode
 from openviking.storage.errors import (
     CollectionNotFoundError,
     EmbeddingConfigurationError,
@@ -26,6 +27,7 @@ from openviking.storage.errors import (
 )
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.viking_vector_index_backend import (
     VIKINGDB_CONTENT_MAX_SIZE,
     VikingVectorIndexBackend,
@@ -118,6 +120,19 @@ class CollectionSchemas:
                 {"FieldName": "content", "FieldType": "text"},
                 {"FieldName": "account_id", "FieldType": "string"},
                 {"FieldName": "owner_user_id", "FieldType": "string"},
+                {
+                    "FieldName": ACL_MODE_FIELD,
+                    "FieldType": "string",
+                    "DefaultValue": AclMode.NONE.value,
+                },
+                *[
+                    {
+                        "FieldName": field,
+                        "FieldType": "list<string>",
+                        "DefaultValue": [],
+                    }
+                    for field in ACL_GRANT_FIELDS
+                ],
             ]
         )
         scalar_index = [
@@ -136,6 +151,8 @@ class CollectionSchemas:
                 "search_tags",
                 "account_id",
                 "owner_user_id",
+                ACL_MODE_FIELD,
+                *ACL_GRANT_FIELDS,
             ]
         )
         return {
@@ -306,6 +323,24 @@ async def init_context_collection(storage) -> bool:
             "Existing collection metadata is unavailable; cannot validate embedding compatibility"
         )
 
+    expected_fields = {field.get("FieldName") for field in schema["Fields"]}
+    existing_fields = {field.get("FieldName") for field in existing_meta.get("Fields", [])}
+    missing_fields = sorted(expected_fields - existing_fields)
+    expected_scalar_indexes = set(schema["ScalarIndex"])
+    existing_scalar_indexes = set(existing_meta.get("ScalarIndex", []))
+    missing_scalar_indexes = sorted(expected_scalar_indexes - existing_scalar_indexes)
+
+    async def _update_local_schema() -> None:
+        if vectordb_cfg.backend not in {"local", "cuvs"} or "Fields" not in existing_meta:
+            return
+        if not missing_fields and not missing_scalar_indexes:
+            return
+        if not hasattr(storage, "update_collection_schema"):
+            raise EmbeddingConfigurationError(
+                "Local context collection does not support automatic schema updates"
+            )
+        await storage.update_collection_schema(schema["Fields"], schema["ScalarIndex"])
+
     base_description, existing_embedding_meta = _decode_collection_description(
         existing_meta.get("Description")
     )
@@ -324,6 +359,7 @@ async def init_context_collection(storage) -> bool:
         )
 
     if _embedding_metadata_compatible(existing_embedding_meta, embedding_meta):
+        await _update_local_schema()
         return False
 
     existing_count = await storage.count() if hasattr(storage, "count") else 0
@@ -335,6 +371,7 @@ async def init_context_collection(storage) -> bool:
                     embedding_meta,
                 )
             )
+            await _update_local_schema()
             return False
 
     if existing_embedding_meta is None:
@@ -350,6 +387,7 @@ async def init_context_collection(storage) -> bool:
                     embedding_meta,
                 )
             )
+        await _update_local_schema()
         return False
 
     if existing_count == 0 and hasattr(storage, "update_collection_description"):
@@ -359,6 +397,7 @@ async def init_context_collection(storage) -> bool:
                 embedding_meta,
             )
         )
+        await _update_local_schema()
         return False
 
     # Embedding metadata differs from current config and the collection is
@@ -394,6 +433,7 @@ async def init_context_collection(storage) -> bool:
                 embedding_meta,
             )
         )
+        await _update_local_schema()
         return False
 
     if dimension_changed:
@@ -503,20 +543,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             return cls._request_stats_by_telemetry_id.pop(telemetry_id, None)
 
     @staticmethod
-    def _seed_uri_for_id(uri: str, level: Any) -> str:
-        """Build deterministic id seed URI from canonical uri + hierarchy level."""
-        try:
-            level_int = int(level)
-        except (TypeError, ValueError):
-            level_int = 2
-
-        if level_int == 0:
-            return uri if uri.endswith("/.abstract.md") else f"{uri}/.abstract.md"
-        if level_int == 1:
-            return uri if uri.endswith("/.overview.md") else f"{uri}/.overview.md"
-        return uri
-
-    @staticmethod
     def _embedding_msg_log_context(embedding_msg: Optional[EmbeddingMsg]) -> str:
         """Return the URI allowed in embedding logs."""
         if embedding_msg is None:
@@ -586,8 +612,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             embedding_msg = EmbeddingMsg.from_json(data["data"])
             inserted_data = embedding_msg.context_data
             account_id = inserted_data.get("account_id", "default")
-            user = UserIdentifier(account_id=account_id, user_id="default")
-            ctx = RequestContext(user=user, role=Role.ROOT)
+            context_user = inserted_data.get("user") or {}
+            user_id = (
+                context_user.get("user_id")
+                or inserted_data.get("owner_user_id")
+                or "default"
+            )
+            user = UserIdentifier(account_id=account_id, user_id=user_id)
+            ctx = RequestContext(user=user, role=Role.USER, bypass_acl=True)
             collector = resolve_telemetry(embedding_msg.telemetry_id)
             telemetry_ctx = bind_telemetry(collector) if collector is not None else nullcontext()
 
@@ -792,9 +824,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     # Ensure vector DB has deterministic IDs per semantic layer.
                     uri = inserted_data.get("uri")
                     if uri:
-                        seed_uri = self._seed_uri_for_id(uri, inserted_data.get("level", 2))
-                        id_seed = f"{account_id}:{seed_uri}"
-                        inserted_data["id"] = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
+                        inserted_data["id"] = vector_record_id(
+                            account_id, uri, inserted_data.get("level", 2)
+                        )
 
                     if self._vikingdb.uses_content_field:
                         inserted_data["content"] = await self._materialize_content(

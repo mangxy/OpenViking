@@ -1,7 +1,7 @@
 import { buildUserAgent, resolveOpenVikingCredentials } from "./shared/credentials.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 
-export const PLUGIN_VERSION = "0.2.1";
+export const PLUGIN_VERSION = "0.3.0";
 
 /**
  * Namespace for the bridged OpenViking MCP tools. DSH publishes every MCP tool
@@ -18,6 +18,7 @@ const DEFAULT_CONFIG = Object.freeze({
   peerId: "",
   userAgent: "",
   workspacePeer: true,
+  peerSource: "",
   recallPeerScope: "all",
   recallQueryExpansion: "auto",
   recallQueryExpansionConfigured: false,
@@ -37,6 +38,7 @@ const DEFAULT_CONFIG = Object.freeze({
   captureMaxLength: 24000,
   captureToolMaxChars: 1000000,
   captureAssistantTurns: true,
+  skipSubagentSessions: false,
   requestTimeoutMs: 10000,
   mcpToolCallTimeoutMs: 60000,
 });
@@ -54,6 +56,7 @@ export function resolveConfig(input = {}, env = process.env, cwd = process.cwd()
     peerId: explicitPeerId,
     explicitPeerId,
     userAgent: buildUserAgent("dsh", PLUGIN_VERSION),
+    harness: "dsh",
     recallLimitConfigured: Object.prototype.hasOwnProperty.call(input, "recallLimit"),
     recallQueryExpansionConfigured: Object.prototype.hasOwnProperty.call(input, "recallQueryExpansion"),
   };
@@ -78,7 +81,9 @@ export function resolveConfig(input = {}, env = process.env, cwd = process.cwd()
 
   config.endpoint = String(config.endpoint || DEFAULT_CONFIG.endpoint).replace(/\/+$/, "");
   config.workspacePeer = config.workspacePeer !== false;
-  config.peerId = resolveEffectivePeerId({ cfg: config, cwd }).peerId;
+  const effectivePeer = resolveEffectivePeerId({ cfg: config, cwd });
+  config.peerId = effectivePeer.peerId;
+  config.legacyPeerId = effectivePeer.legacyPeerId;
   config.recallPeerScope = config.recallPeerScope === "actor" ? "actor" : "all";
   config.recallQueryExpansion = config.recallQueryExpansion === "off" ? "off" : "auto";
   config.recallLimit = clampInteger(config.recallLimit, 1, 50, DEFAULT_CONFIG.recallLimit);
@@ -152,6 +157,7 @@ export function resolveConfig(input = {}, env = process.env, cwd = process.cwd()
   config.syncTurns = config.syncTurns !== false;
   config.captureAssistantTurns = config.captureAssistantTurns !== false;
   config.captureToolResults = config.captureToolResults === true;
+  config.skipSubagentSessions = config.skipSubagentSessions === true;
   return config;
 }
 

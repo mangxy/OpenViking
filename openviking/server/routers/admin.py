@@ -5,13 +5,14 @@
 import asyncio
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, Path, Request
+from fastapi import APIRouter, Body, Depends, Path, Query, Request
 from pydantic import BaseModel
 
 from openviking.server.account_settings import (
     AccountAgentEvolutionSettings,
     AccountSettings,
     AccountSettingsPatch,
+    effective_acl_enabled,
     read_account_settings,
     update_account_settings,
 )
@@ -81,6 +82,12 @@ class RegenerateKeyRequest(BaseModel):
     seed: str | None = None
 
 
+class CreateGroupRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    group_id: str
+
+
 class MigrateLegacyDataRequest(BaseModel):
     action: str = "migrate"
 
@@ -109,7 +116,7 @@ async def get_agent_evolution_status(
 ):
     """Return the effective Agent Evolution switch for the caller's account."""
     account_id = _agent_evolution_account_id(ctx)
-    _check_account_exists(request, account_id)
+    await _check_account_exists(request, account_id)
     enabled = await get_service().sessions.get_agent_evolution_enabled(account_id)
     return Response(
         status="ok",
@@ -126,7 +133,7 @@ async def set_agent_evolution_status(
 ):
     """Persist and hot-reload Agent Evolution for the caller's account."""
     account_id = _agent_evolution_account_id(ctx)
-    _check_account_exists(request, account_id)
+    await _check_account_exists(request, account_id)
     service = get_service()
     if service.viking_fs is None:
         raise FailedPreconditionError("OpenViking service is not initialized.")
@@ -154,19 +161,33 @@ def _should_expose_user_key(request: Request) -> bool:
     return config.get_effective_auth_mode() != "trusted"
 
 
+def _registry_watcher_running(request: Request) -> bool:
+    plugin = getattr(request.app.state, "auth_plugin", None)
+    watch_task = getattr(plugin, "_watch_task", None)
+    return watch_task is not None and not watch_task.done()
+
+
 def _check_account_access(ctx: RequestContext, account_id: str) -> None:
     """ADMIN can only operate on their own account."""
     if ctx.role == Role.ADMIN and ctx.account_id != account_id:
         raise PermissionDeniedError(f"ADMIN can only manage account: {ctx.account_id}")
 
 
-def _check_account_exists(request: Request, account_id: str) -> None:
+async def _check_account_exists(
+    request: Request, account_id: str, *, refresh_scope: str | None = None
+):
     manager = getattr(request.app.state, "api_key_manager", None)
     if manager is None:
-        return
+        return None
+    watcher_running = _registry_watcher_running(request)
+    if not watcher_running:
+        await manager.refresh_accounts_from_store()
     accounts = manager.get_accounts()
     if not any(item.get("account_id") == account_id for item in accounts):
         raise NotFoundError(account_id, "account")
+    if refresh_scope is not None and not watcher_running:
+        await manager.refresh_account_users_from_store(refresh_scope)
+    return manager
 
 
 async def _account_settings_result(
@@ -179,7 +200,10 @@ async def _account_settings_result(
         "settings": {
             "agent_evolution": {
                 "enabled": enabled,
-            }
+            },
+            "acl": {
+                "enabled": effective_acl_enabled(settings),
+            },
         },
         "overrides": settings.model_dump(exclude_none=True),
     }
@@ -195,7 +219,7 @@ def _has_initial_user_config(user_config: UserConfig | None) -> bool:
     return bool(_has_add_targets(user_config) or (user_config and user_config.memory_policy))
 
 
-def _validate_initial_user_config(
+async def _validate_initial_user_config(
     service,
     user_ctx: RequestContext,
     user_config: UserConfig | None,
@@ -205,7 +229,7 @@ def _validate_initial_user_config(
     if service.viking_fs is None:
         raise FailedPreconditionError("OpenViking service is not initialized.")
     if _has_add_targets(user_config):
-        validate_add_targets(
+        await validate_add_targets(
             user_config.add_targets,
             ctx=user_ctx,
             viking_fs=service.viking_fs,
@@ -224,8 +248,10 @@ async def _write_initial_user_config(
     await write_user_config(service.viking_fs, user_ctx, user_config)
 
 
-def _check_user_exists(request: Request, account_id: str, user_id: str) -> None:
-    manager = _get_api_key_manager(request)
+async def _check_user_exists(
+    request: Request, account_id: str, user_id: str, manager=None
+) -> None:
+    manager = manager or _get_api_key_manager(request)
     if not manager.has_user(account_id, user_id):
         raise NotFoundError(user_id, "user")
 
@@ -292,15 +318,14 @@ async def create_account(
         user=UserIdentifier(body.account_id, body.admin_user_id),
         role=Role.ADMIN,
     )
-    _validate_initial_user_config(service, account_ctx, body.user_config)
+    await _validate_initial_user_config(service, account_ctx, body.user_config)
     manager = _get_api_key_manager(request)
     user_key = await manager.create_account(
         body.account_id,
         body.admin_user_id,
         seed=body.seed,
     )
-    await service.initialize_account_directories(account_ctx)
-    await service.initialize_user_directories(account_ctx)
+    await service.initialize_account_workspace(account_ctx)
     await _write_initial_user_config(service, account_ctx, body.user_config)
     result = {
         "account_id": body.account_id,
@@ -315,11 +340,16 @@ async def create_account(
 @require_auth_root
 async def list_accounts(
     request: Request,
+    name: str | None = None,
+    limit: int | None = Query(None, ge=1, description="Page size; omit to return all"),
+    page: int = Query(1, ge=1, description="1-based page number (requires limit)"),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    """List all accounts."""
+    """List accounts in creation order. `name` supports wildcard (* and ?) matching."""
     manager = _get_api_key_manager(request)
-    accounts = manager.get_accounts()
+    if not _registry_watcher_running(request):
+        await manager.refresh_accounts_from_store()
+    accounts = manager.get_accounts(name_filter=name, limit=limit, page=page)
     return Response(status="ok", result=accounts)
 
 
@@ -396,7 +426,7 @@ async def delete_account(
     try:
         storage = viking_fs._get_vector_store()
         if storage:
-            deleted = await storage.delete_account_data(account_id)
+            deleted = await storage.delete_account_data(account_id, ctx=ctx)
             logger.info(f"VectorDB cascade delete for account {account_id}: {deleted} records")
     except Exception as e:
         logger.warning(f"VectorDB cleanup for account {account_id}: {e}")
@@ -415,7 +445,7 @@ async def get_account_settings(
 ):
     """Return effective and explicitly overridden settings for one account."""
     _check_account_access(ctx, account_id)
-    _check_account_exists(request, account_id)
+    await _check_account_exists(request, account_id)
     service = get_service()
     if service.viking_fs is None:
         raise FailedPreconditionError("OpenViking service is not initialized.")
@@ -436,7 +466,7 @@ async def patch_account_settings(
 ):
     """Update allowlisted hot-reloadable settings for one account."""
     _check_account_access(ctx, account_id)
-    _check_account_exists(request, account_id)
+    await _check_account_exists(request, account_id)
     service = get_service()
     if service.viking_fs is None:
         raise FailedPreconditionError("OpenViking service is not initialized.")
@@ -466,7 +496,7 @@ async def register_user(
         user=UserIdentifier(account_id, body.user_id),
         role=resolved_role,
     )
-    _validate_initial_user_config(service, user_ctx, body.user_config)
+    await _validate_initial_user_config(service, user_ctx, body.user_config)
     manager = _get_api_key_manager(request)
     user_key = await manager.register_user(
         account_id,
@@ -490,17 +520,25 @@ async def register_user(
 async def list_users(
     request: Request,
     account_id: str = Path(..., description="Account ID"),
-    limit: int = 100,
+    limit: int | None = Query(None, ge=1, description="Page size; omit to return all"),
     name: str | None = None,
     role: str | None = None,
+    page: int = Query(1, ge=1, description="1-based page number (requires limit)"),
     ctx: RequestContext = Depends(get_request_context),
 ):
-    """List all users in an account."""
+    """List users in an account, in creation order. `name` supports wildcard (* and ?) matching."""
     _check_account_access(ctx, account_id)
     manager = _get_api_key_manager(request)
+    if not _registry_watcher_running(request):
+        await manager.refresh_account_users_from_store(account_id)
     expose_key = _should_expose_user_key(request)
     users = manager.get_users(
-        account_id, limit=limit, name_filter=name, role_filter=role, expose_key=expose_key
+        account_id,
+        limit=limit,
+        name_filter=name,
+        role_filter=role,
+        expose_key=expose_key,
+        page=page,
     )
     return Response(status="ok", result=users)
 
@@ -515,8 +553,8 @@ async def get_user_settings(
 ):
     """Return the configured and effective memory policy for one User."""
     _check_account_access(ctx, account_id)
-    _check_account_exists(request, account_id)
-    _check_user_exists(request, account_id, user_id)
+    manager = await _check_account_exists(request, account_id, refresh_scope=account_id)
+    await _check_user_exists(request, account_id, user_id, manager)
     service = get_service()
     if service.viking_fs is None:
         raise FailedPreconditionError("OpenViking service is not initialized.")
@@ -547,8 +585,8 @@ async def patch_user_settings(
 ):
     """Update or clear the allowlisted User memory policy without restarting."""
     _check_account_access(ctx, account_id)
-    _check_account_exists(request, account_id)
-    _check_user_exists(request, account_id, user_id)
+    manager = await _check_account_exists(request, account_id, refresh_scope=account_id)
+    await _check_user_exists(request, account_id, user_id, manager)
     service = get_service()
     if service.viking_fs is None:
         raise FailedPreconditionError("OpenViking service is not initialized.")
@@ -629,3 +667,93 @@ async def regenerate_key(
         seed=body.seed if body is not None else None,
     )
     return Response(status="ok", result={"user_key": new_key})
+
+
+# ---- Group endpoints ----
+
+
+@router.post("/accounts/{account_id}/groups")
+@require_auth_root_or_admin
+async def create_group(
+    body: CreateGroupRequest,
+    request: Request,
+    account_id: str = Path(..., description="Account ID"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    _check_account_access(ctx, account_id)
+    result = await _get_api_key_manager(request).create_group(account_id, body.group_id)
+    return Response(status="ok", result=result)
+
+
+@router.get("/accounts/{account_id}/groups")
+@require_auth_root_or_admin
+async def list_groups(
+    request: Request,
+    account_id: str = Path(..., description="Account ID"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    _check_account_access(ctx, account_id)
+    manager = _get_api_key_manager(request)
+    await manager.ensure_account_groups_loaded(account_id)
+    result = manager.get_groups(account_id)
+    return Response(status="ok", result=result)
+
+
+@router.delete("/accounts/{account_id}/groups/{group_id}")
+@require_auth_root_or_admin
+async def delete_group(
+    request: Request,
+    account_id: str = Path(..., description="Account ID"),
+    group_id: str = Path(..., description="Group ID"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    _check_account_access(ctx, account_id)
+    await _get_api_key_manager(request).delete_group(account_id, group_id)
+    return Response(status="ok", result={"deleted": True})
+
+
+@router.get("/accounts/{account_id}/groups/{group_id}/members")
+@require_auth_root_or_admin
+async def list_group_members(
+    request: Request,
+    account_id: str = Path(..., description="Account ID"),
+    group_id: str = Path(..., description="Group ID"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    _check_account_access(ctx, account_id)
+    manager = _get_api_key_manager(request)
+    await manager.ensure_account_groups_loaded(account_id)
+    members = manager.get_group_members(account_id, group_id)
+    return Response(status="ok", result={"group_id": group_id, "members": members})
+
+
+@router.put("/accounts/{account_id}/groups/{group_id}/members/{user_id}")
+@require_auth_root_or_admin
+async def add_group_member(
+    request: Request,
+    account_id: str = Path(..., description="Account ID"),
+    group_id: str = Path(..., description="Group ID"),
+    user_id: str = Path(..., description="User ID"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    _check_account_access(ctx, account_id)
+    added = await _get_api_key_manager(request).add_group_member(
+        account_id, group_id, user_id
+    )
+    return Response(status="ok", result={"added": added})
+
+
+@router.delete("/accounts/{account_id}/groups/{group_id}/members/{user_id}")
+@require_auth_root_or_admin
+async def remove_group_member(
+    request: Request,
+    account_id: str = Path(..., description="Account ID"),
+    group_id: str = Path(..., description="Group ID"),
+    user_id: str = Path(..., description="User ID"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    _check_account_access(ctx, account_id)
+    removed = await _get_api_key_manager(request).remove_group_member(
+        account_id, group_id, user_id
+    )
+    return Response(status="ok", result={"removed": removed})

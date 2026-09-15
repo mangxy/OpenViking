@@ -13,9 +13,8 @@ import { resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../scripts/config.mjs";
 import { createLogger } from "../scripts/debug-log.mjs";
-import { buildMcpProxyConfig } from "../scripts/shared/mcp-proxy-config.mjs";
+import { buildMcpProxyConfig, resolveMcpActorPeerId } from "../scripts/shared/mcp-proxy-config.mjs";
 import { createOpenVikingMcpProxy } from "../scripts/shared/mcp-proxy-core.mjs";
-import { resolveEffectivePeerId } from "../scripts/shared/workspace-peer.mjs";
 
 function readProxyConfig() {
   const cfg = loadConfig();
@@ -24,14 +23,14 @@ function readProxyConfig() {
     apiKey: cfg.apiKey,
     account: cfg.accountId,
     user: cfg.userId,
-    peerId: resolveEffectivePeerId({ cfg, cwd: process.cwd() }).peerId,
+    peerId: resolveMcpActorPeerId(cfg),
     userAgent: cfg.userAgent,
     timeoutMs: cfg.timeoutMs,
     debug: cfg.debug,
     debugLogPath: cfg.debugLogPath,
-    credentialSource: cfg.configPath?.endsWith("ovcli.conf") ? "ovcli" : "auto",
-    credentialPath: cfg.configPath,
-    watchedPaths: [cfg.configPath],
+    credentialSource: cfg.credentialSource,
+    credentialPath: cfg.credentialPath || "",
+    watchedPaths: [cfg.credentialPath, cfg.configPath].filter(Boolean),
   });
 }
 
