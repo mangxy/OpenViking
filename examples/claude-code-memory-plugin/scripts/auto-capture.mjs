@@ -453,11 +453,9 @@ async function main({ cfg, input, cwd }) {
     writeJsonState("daily-stats.json", { date: today, archives });
   }
 
+  // mengxy-patch 刀5: keep the familiar auto-save toast wording.
   if (result.ok === 0) return undefined;
-  return `captured ${result.ok} turns to ov session ${ovSessionId}`
-    + (committed
-      ? ` (committed${commitTraceId ? `; trace_id=${commitTraceId}` : ""})`
-      : "");
+  return `🧠 OpenViking · Auto-saved · ${result.ok} turns${committed ? " · committed ✓" : ""}`;
 }
 
 async function start() {
