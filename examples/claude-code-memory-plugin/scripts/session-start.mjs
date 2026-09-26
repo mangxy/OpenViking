@@ -54,13 +54,15 @@ function output(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-function approve(additionalContext) {
+function approve(additionalContext, systemMessage) {
   const out = { decision: "approve" };
   if (additionalContext) {
     out.hookSpecificOutput = {
       hookEventName: "SessionStart",
       additionalContext,
     };
+    // mengxy-patch 刀5: optional one-line toast so the user sees the injection.
+    if (systemMessage) out.systemMessage = systemMessage;
   }
   output(out);
 }
@@ -95,10 +97,12 @@ function writeLastInject(content) {
   }
 }
 
+let toastMsg = null;
+
 runHookStage({
   loadConfig,
   input: { tolerant: true },
-  envelope: approve,
+  envelope: (msg) => approve(msg, toastMsg),
   onSkip: (reason) => log("skip", { reason }),
 }, async ({ cfg, input, cwd, sessionId }) => {
   const source = input.source || "startup";
@@ -190,6 +194,13 @@ runHookStage({
 
   const composed = `<openviking-context source="${source}">\n${sections.join("\n")}\n</openviking-context>`;
   writeLastInject(composed);
+
+  // mengxy-patch 刀5: toast telling the user what got injected.
+  toastMsg = cfg.toast
+    ? `🧠 OpenViking ${source}: injected ${
+        profile ? `${profile.prefCount} preferences + ${profile.entCount} entities` : "context"
+      }${archiveSection ? " + session archive" : ""}`
+    : null;
 
   if (cfg.debug) {
     process.stderr.write(

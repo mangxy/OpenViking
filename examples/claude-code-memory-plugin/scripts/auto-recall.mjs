@@ -32,9 +32,13 @@ function output(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-function approve(msg) {
+function approve(msg, systemMessage) {
   const out = { decision: "approve" };
-  if (msg) out.hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: msg };
+  if (msg) {
+    out.hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: msg };
+    // mengxy-patch 刀5: optional one-line toast so the user sees the recall.
+    if (systemMessage) out.systemMessage = systemMessage;
+  }
   output(out);
 }
 
@@ -68,10 +72,12 @@ function writeRecallState(extra) {
   });
 }
 
+let toastMsg = null;
+
 runHookStage({
   loadConfig,
   gates: { enabled: (cfg) => cfg.autoRecall },
-  envelope: approve,
+  envelope: (msg) => approve(msg, toastMsg),
   onSkip: (reason, { cfg, sessionId }) => {
     log("skip", { reason });
     if (cfg.enabled !== false) writeRecallState({ count: 0, reason, cc_session_id: sessionId });
@@ -129,12 +135,13 @@ runHookStage({
     return;
   }
 
+  // A server-assembled block is one rendered unit whatever it holds, so the
+  // count the statusline shows comes from the URIs it cites.
+  const recalledCount = recalled.stage === "server_assembled"
+    ? new Set(recalled.block.match(URI_RE) || []).size
+    : recalled.contentCount + recalled.hintCount;
   writeRecallState({
-    // A server-assembled block is one rendered unit whatever it holds, so the
-    // count the statusline shows comes from the URIs it cites.
-    count: recalled.stage === "server_assembled"
-      ? new Set(recalled.block.match(URI_RE) || []).size
-      : recalled.contentCount + recalled.hintCount,
+    count: recalledCount,
     content_items: recalled.contentCount,
     hint_items: recalled.hintCount,
     tokens_used: recalled.budgetUsed,
@@ -142,5 +149,7 @@ runHookStage({
     cc_session_id: sessionId,
     reason: "ok",
   });
+  // mengxy-patch 刀5: toast with the same count the statusline shows.
+  toastMsg = cfg.toast ? `🧠 OpenViking recall: ${recalledCount} memories` : null;
   return recalled.block;
 }).catch((err) => { logError("uncaught", err); approve(); });

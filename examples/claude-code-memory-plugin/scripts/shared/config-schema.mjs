@@ -77,6 +77,10 @@ export const KNOBS = [
     workspace: "recall.enabled",
     capability: "recall",
   },
+  // mengxy-patch 刀5: injected-context toast — one-line systemMessage alongside
+  // additionalContext so the user sees the plugin is alive and how much it
+  // recalled. Opt-out via OPENVIKING_TOAST=0 or cc.toast=false.
+  { name: "toast", type: "bool", default: true, env: "OPENVIKING_TOAST", capability: "recall" },
   { name: "recallLimit", type: "int", default: 10, min: 1, max: 50, env: "OPENVIKING_RECALL_LIMIT", workspace: "recall.max_items", sendOnlyWhenConfigured: true, capability: "recall" },
   { name: "scoreThreshold", type: "number", default: 0.35, min: 0, max: 1, env: "OPENVIKING_SCORE_THRESHOLD", aliases: ["recallScoreThreshold"], workspace: "recall.score_threshold", capability: "recall" },
   { name: "minQueryLength", type: "int", default: 3, min: 1, max: 64, env: "OPENVIKING_MIN_QUERY_LENGTH", aliases: ["recallMinQueryLength"], capability: "recall" },
