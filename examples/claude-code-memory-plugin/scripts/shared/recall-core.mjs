@@ -101,6 +101,9 @@ export function buildRecallEndpointBody(cfg = {}) {
     max_chars: Math.max(Number(cfg.recallMaxContentChars || 0) * limit, 1000),
     min_score: Number.isFinite(Number(cfg.scoreThreshold)) ? Number(cfg.scoreThreshold) : 0.35,
     render: true,
+    // mengxy-patch: query expansion hits oMLX and fails on the prefill memory
+    // guard after burning seconds per recall; skip it, search the raw query.
+    query_expansion: "off",
   };
   if (cfg.recallPeerScope === "actor") body.peer_scope = "actor";
   return body;
@@ -123,6 +126,9 @@ export function buildContextSearchBody(cfg = {}, options = {}) {
     mode: "context",
     purpose: "coding",
     score_threshold: Number.isFinite(Number(cfg.scoreThreshold)) ? Number(cfg.scoreThreshold) : 0.35,
+    // mengxy-patch: query expansion hits oMLX and fails on the prefill memory
+    // guard after burning seconds per recall; skip it, search the raw query.
+    query_expansion: "off",
   };
   const limitConfigured = cfg.recallLimitConfigured === true;
   const maxTokensConfigured = cfg.recallMaxTokensConfigured === true;
@@ -318,18 +324,11 @@ async function searchOneSource(fetchJSON, cfg, query, source, limit, options) {
   const search = async (target, session) => {
     const body = { query, target_uri: target, limit, score_threshold: 0 };
     if (session) body.session_id = session;
-    const init = { method: "POST", body: JSON.stringify(body) };
-    // Session-aware retrieval may decide no context is needed. Only after all
-    // targets are empty do we retry without the session. Old servers still
-    // support find; an unsupported search route can fall back to it.
-    let res = await fetchJSON(sessionId ? "/api/v1/search/search" : "/api/v1/search/find", init, { actorPeerId });
-    if (sessionId && !res.ok && (
-      !res.status || res.status === 404 || res.status === 405 || res.status >= 500
-      || ((res.status === 400 || res.status === 422) && looksLikeUnknownField(res))
-    )) {
-      const { session_id, ...findBody } = body;
-      res = await fetchJSON("/api/v1/search/find", { method: "POST", body: JSON.stringify(findBody) }, { actorPeerId });
-    }
+    // mengxy-patch: always hit /find (QUICK retrieval). The session-aware
+    // /search route forces THINKING rerank on this server and takes ~9s per
+    // turn; the recall quality delta is not worth blocking every prompt.
+    const { session_id, ...findBody } = body;
+    let res = await fetchJSON("/api/v1/search/find", { method: "POST", body: JSON.stringify(findBody) }, { actorPeerId });
     const items = res.ok && Array.isArray(res.result?.[source.bucket]) ? res.result[source.bucket] : [];
     return items.map((item) => ({ ...item, _sourceType: source.type }));
   };
