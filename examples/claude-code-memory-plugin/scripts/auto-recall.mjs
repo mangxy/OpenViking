@@ -53,6 +53,7 @@ async function recall(cfg, query, peer, sessionId) {
     log,
     runCompressor,
     localCompressorAvailable: Boolean(runCompressor),
+    excludeUris: cfg.recallExcludeUris,
   });
 }
 

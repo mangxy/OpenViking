@@ -182,6 +182,11 @@ def test_json_protocol_preserves_stable_parser_and_empty_contract():
     assert '"preferences": []' in protocol.render_final_instruction(context)
     assert '"delete_ids": []' in protocol.render_final_instruction(context)
 
+    assert protocol.parse('{"memory_operations": [{"type": "edit"}]}', context) == (
+        None,
+        "No expected fields found; got fields: memory_operations",
+    )
+
 
 def test_python_contract_and_bindings_expose_only_selected_schema_fields():
     uri = "viking://user/alice/memories/preferences/editor.md"
@@ -1119,6 +1124,49 @@ sdk.commit()
         {"search": "Use Vim", "replace": "Use Neovim"},
         {"delete": "Dark theme"},
     ]
+
+
+@pytest.mark.parametrize("memory_type", ["experiences", "entities"])
+@pytest.mark.parametrize("method", ['edit(search="old", replace="new")', 'drop(text="old")'])
+def test_python_builtin_content_edit_respects_merge_op_and_offers_valid_repair(memory_type, method):
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / f"{memory_type}.yaml"))
+    schema = registry.get(memory_type)
+    assert schema is not None
+    context = _context(
+        [schema],
+        files=[
+            MemoryFile(
+                uri=f"viking://user/alice/memories/{memory_type}/one.md",
+                memory_type=memory_type,
+                content="old text",
+                extra_fields=(
+                    {"experience_name": "one", "supersedes": ""}
+                    if memory_type == "experiences"
+                    else {"category": "concept", "name": "one"}
+                ),
+            )
+        ],
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse(f"{memory_type}_1.content.{method}", context)
+
+    if memory_type == "entities":
+        assert error is None
+        assert operations is not None
+        assert operations.model_dump()[memory_type][0]["content"]["blocks"]
+    else:
+        assert operations is None
+        assert error is not None
+        assert "merge_op=replace" in error
+        retry = protocol.render_format_retry(error)
+        correction = retry.split("`")[1]
+        assert correction.startswith("experiences_1.content.update(")
+        operations, error = protocol.parse(correction, context)
+        assert error is None
+        assert operations is not None
+        assert operations.model_dump()[memory_type][0]["content"] == "complete new value"
 
 
 def test_python_field_update_replaces_whole_field():
