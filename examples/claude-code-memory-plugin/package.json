@@ -1,7 +1,7 @@
 {
   "name": "claude-code-openviking-memory",
 
-  "version": "0.7.8-mengxy.1",
+  "version": "0.7.8-mengxy.2",
 
   "description": "OpenViking memory plugin for Claude Code — semantic long-term memory",
   "type": "module",

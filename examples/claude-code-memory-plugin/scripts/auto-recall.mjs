@@ -151,6 +151,6 @@ runHookStage({
     reason: "ok",
   });
   // mengxy-patch 刀5: toast with the same count the statusline shows.
-  toastMsg = cfg.toast ? `🧠 OpenViking recall: ${recalledCount} memories` : null;
+  toastMsg = cfg.toast ? `OpenViking recall: ${recalledCount} memories` : null;
   return recalled.block;
 }).catch((err) => { logError("uncaught", err); approve(); });

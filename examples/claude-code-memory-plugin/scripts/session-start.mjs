@@ -197,7 +197,7 @@ runHookStage({
 
   // mengxy-patch 刀5: toast telling the user what got injected.
   toastMsg = cfg.toast
-    ? `🧠 OpenViking ${source}: injected ${
+    ? `OpenViking ${source}: injected ${
         profile ? `${profile.prefCount} preferences + ${profile.entCount} entities` : "context"
       }${archiveSection ? " + session archive" : ""}`
     : null;
