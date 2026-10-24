@@ -161,7 +161,7 @@ async function main() {
     const bypassParts = [yellow("OpenViking ⚡ bypass")];
     const modelCtx = modelCtxSegment(stdin);
     if (modelCtx) bypassParts.push(modelCtx);
-    process.stdout.write(truncate(bypassParts.join(dim(" │ "))));
+    process.stdout.write(truncate(bypassParts.join(dim(" | "))));
     return;
   }
 
@@ -243,7 +243,7 @@ async function main() {
     parts.push(dim(`+${daily.archives} today`));
   }
 
-  const line = parts.join(dim(" │ "));
+  const line = parts.join(dim(" | "));
   process.stdout.write(truncate(line));
 }
 
