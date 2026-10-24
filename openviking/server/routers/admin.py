@@ -4,7 +4,7 @@
 
 import asyncio
 from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, Path, Query, Request
 from fastapi import Response as HTTPResponse
@@ -16,7 +16,6 @@ from openviking.server.api_keys.models import validate_account_user_role
 from openviking.server.auth import (
     get_api_key_manager_or_raise,
     get_request_context,
-    registry_watcher_running,
     require_auth_root,
     require_auth_root_or_admin,
     should_expose_user_key,
@@ -227,7 +226,7 @@ async def set_agent_evolution_status(
 
 
 def _get_api_key_manager(request: Request):
-    """Get APIKeyManager from app state."""
+    """Return API key management operations for compatibility callers."""
     return get_api_key_manager_or_raise(request)
 
 
@@ -246,21 +245,18 @@ def _check_account_access(ctx: RequestContext, account_id: str) -> None:
         raise PermissionDeniedError(f"ADMIN can only manage account: {ctx.account_id}")
 
 
-async def _check_account_exists(
-    request: Request, account_id: str, *, refresh_scope: str | None = None
-):
+async def _check_account_exists(request: Request, account_id: str):
     manager = getattr(request.app.state, "api_key_manager", None)
     if manager is None:
         return None
-    watcher_running = registry_watcher_running(request)
-    if not watcher_running:
-        await manager.refresh_accounts_from_store()
-    accounts = manager.get_accounts()
-    if not any(item.get("account_id") == account_id for item in accounts):
+    account = await manager.get_account(account_id)
+    if account is None:
         raise NotFoundError(account_id, "account")
-    manager.ensure_account_active(account_id)
-    if refresh_scope is not None and not watcher_running:
-        await manager.refresh_account_users_from_store(refresh_scope)
+    if account["status"] != "active":
+        raise FailedPreconditionError(
+            "Account is not active",
+            details={"task_id": account.get("task_id")},
+        )
     return manager
 
 
@@ -343,9 +339,9 @@ async def _rollback_account_creation(
 ) -> None:
     """Compensate resources created after the account registry entry.
 
-    ``APIKeyManager.create_account`` already rolls back its own registry writes.
-    This covers the later workspace, user-config and runtime-config steps when
-    one of them fails.
+    Account creation and its initial API key are committed atomically by the
+    AccountStore. This covers the later workspace, user-config and runtime-config
+    steps when one of them fails.
     """
     if deletion_service is not None and actor is not None:
         try:
@@ -398,7 +394,7 @@ async def _check_user_exists(
     request: Request, account_id: str, user_id: str, manager=None
 ) -> None:
     manager = manager or _get_api_key_manager(request)
-    if not manager.has_user(account_id, user_id):
+    if await manager.get_user_for_management(account_id, user_id) is None:
         raise NotFoundError(user_id, "user")
 
 
@@ -519,11 +515,24 @@ async def list_accounts(
     ctx: RequestContext = Depends(get_request_context),
 ):
     """List accounts in creation order. `name` supports wildcard (* and ?) matching."""
-    manager = _get_api_key_manager(request)
-    if not registry_watcher_running(request):
-        await manager.refresh_accounts_from_store()
-    accounts = manager.get_accounts(name_filter=name, limit=limit, page=page, query_filter=query)
+    accounts = await _get_api_key_manager(request).list_accounts(
+        name_filter=name, limit=limit, page=page, query_filter=query
+    )
     return Response(status="ok", result=accounts)
+
+
+@router.get("/accounts/{account_id}")
+@require_auth_root
+async def get_account(
+    request: Request,
+    account_id: str,
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Return credential-free metadata for one account, or 404 if absent."""
+    account = await _get_api_key_manager(request).get_account(account_id)
+    if account is None:
+        raise NotFoundError(account_id, "account")
+    return Response(status="ok", result=account)
 
 
 @router.post("/migrate")
@@ -803,6 +812,30 @@ async def patch_account_configuration(
     )
 
 
+class ModelConnectionTestRequest(BaseModel):
+    kind: Literal["vlm", "embedding"]
+    config: dict[str, Any]
+    fallback: dict[str, Any] = Field(default_factory=dict)
+    thinking: bool | None = None
+    mode: Literal["dense", "sparse", "hybrid"] = "dense"
+
+
+@router.post("/configuration/test-model", include_in_schema=False)
+@require_auth_root
+async def test_model_configuration(
+    body: ModelConnectionTestRequest,
+    request: Request,
+    response: HTTPResponse,
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Private Studio operation; drafts are never saved or installed at runtime."""
+    from openviking.server.model_connection_test import probe_model
+
+    response.headers["Cache-Control"] = "no-store"
+    result = await probe_model(body.kind, body.config, body.fallback, body.thinking, body.mode)
+    return Response(status="ok", result=result)
+
+
 @router.get("/configuration")
 @require_auth_root
 async def get_cluster_configuration(
@@ -994,15 +1027,12 @@ async def list_users(
     """List users in an account, in creation order. `name` supports wildcard (* and ?) matching."""
     _check_account_access(ctx, account_id)
     manager = _get_api_key_manager(request)
-    if not registry_watcher_running(request):
-        await manager.refresh_account_users_from_store(account_id)
-    expose_key = should_expose_user_key(request)
-    users = manager.get_users_page(
+    users = await manager.list_users_page(
         account_id,
         limit=limit,
         name_filter=name,
         role_filter=role,
-        expose_key=expose_key or not include_credentials,
+        expose_key=should_expose_user_key(request) or not include_credentials,
         page=page,
         query_filter=query,
     )
@@ -1011,11 +1041,33 @@ async def list_users(
             {
                 "user_id": user["user_id"],
                 "role": user["role"],
+                # A key prefix identifies a hash-only credential, which cannot
+                # be supplied to server-side Gateway or Bot Studio bindings.
                 "api_key_available": bool(user.get("api_key")),
             }
             for user in users["users"]
         ]
     return Response(status="ok", result=users if include_summary else users["users"])
+
+
+@router.get("/accounts/{account_id}/users/{user_id}")
+@require_auth_root_or_admin
+async def get_user(
+    request: Request,
+    account_id: str = Path(..., description="Account ID"),
+    user_id: str = Path(..., description="User ID"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Return one user's credential-free membership info, or 404 if absent.
+
+    Deliberately returns only ``user_id`` and ``role``; it never exposes
+    ``api_key`` or ``key_prefix``.
+    """
+    _check_account_access(ctx, account_id)
+    user = await _get_api_key_manager(request).get_user_membership(account_id, user_id)
+    if user is None:
+        raise NotFoundError(user_id, "user")
+    return Response(status="ok", result={"user_id": user_id, "role": user["role"]})
 
 
 @router.get("/accounts/{account_id}/users/{user_id}/settings")
@@ -1028,7 +1080,7 @@ async def get_user_settings(
 ):
     """Return the configured and effective memory policy for one User."""
     _check_account_access(ctx, account_id)
-    manager = await _check_account_exists(request, account_id, refresh_scope=account_id)
+    manager = await _check_account_exists(request, account_id)
     await _check_user_exists(request, account_id, user_id, manager)
     service = get_service()
     if service.viking_fs is None:
@@ -1060,7 +1112,7 @@ async def patch_user_settings(
 ):
     """Update or clear the allowlisted User memory policy without restarting."""
     _check_account_access(ctx, account_id)
-    manager = await _check_account_exists(request, account_id, refresh_scope=account_id)
+    manager = await _check_account_exists(request, account_id)
     await _check_user_exists(request, account_id, user_id, manager)
     service = get_service()
     if service.viking_fs is None:
@@ -1112,8 +1164,7 @@ async def set_user_role(
     _check_account_access(ctx, account_id)
     if body.role != Role.ADMIN:
         raise InvalidArgumentError("set_user_role only supports promotion to admin.")
-    manager = _get_api_key_manager(request)
-    await manager.set_role(account_id, user_id, Role.ADMIN)
+    await _get_api_key_manager(request).set_role(account_id, user_id, Role.ADMIN)
     return Response(
         status="ok",
         result={
@@ -1156,7 +1207,9 @@ async def create_group(
     ctx: RequestContext = Depends(get_request_context),
 ):
     _check_account_access(ctx, account_id)
-    result = await _get_api_key_manager(request).create_group(account_id, body.group_id)
+    result = await _get_api_key_manager(request).create_group(
+        account_id, body.group_id
+    )
     return Response(status="ok", result=result)
 
 
@@ -1168,9 +1221,7 @@ async def list_groups(
     ctx: RequestContext = Depends(get_request_context),
 ):
     _check_account_access(ctx, account_id)
-    manager = _get_api_key_manager(request)
-    await manager.ensure_account_groups_loaded(account_id)
-    result = manager.get_groups(account_id)
+    result = await _get_api_key_manager(request).get_groups(account_id)
     return Response(status="ok", result=result)
 
 
@@ -1196,9 +1247,9 @@ async def list_group_members(
     ctx: RequestContext = Depends(get_request_context),
 ):
     _check_account_access(ctx, account_id)
-    manager = _get_api_key_manager(request)
-    await manager.ensure_account_groups_loaded(account_id)
-    members = manager.get_group_members(account_id, group_id)
+    members = await _get_api_key_manager(request).get_group_members(
+        account_id, group_id
+    )
     return Response(status="ok", result={"group_id": group_id, "members": members})
 
 
@@ -1212,7 +1263,9 @@ async def add_group_member(
     ctx: RequestContext = Depends(get_request_context),
 ):
     _check_account_access(ctx, account_id)
-    added = await _get_api_key_manager(request).add_group_member(account_id, group_id, user_id)
+    added = await _get_api_key_manager(request).add_group_member(
+        account_id, group_id, user_id
+    )
     return Response(status="ok", result={"added": added})
 
 
@@ -1226,5 +1279,7 @@ async def remove_group_member(
     ctx: RequestContext = Depends(get_request_context),
 ):
     _check_account_access(ctx, account_id)
-    removed = await _get_api_key_manager(request).remove_group_member(account_id, group_id, user_id)
+    removed = await _get_api_key_manager(request).remove_group_member(
+        account_id, group_id, user_id
+    )
     return Response(status="ok", result={"removed": removed})
