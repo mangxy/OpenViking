@@ -18,7 +18,11 @@ from openviking.privacy.rules import (
     find_privacy_matches,
     is_sensitive_key,
 )
-from openviking.privacy.sanitizer import PrivacyReplacement, PrivacySanitizer
+from openviking.privacy.sanitizer import (
+    MIN_PROTECTED_VALUE_CHARS,
+    PrivacyReplacement,
+    PrivacySanitizer,
+)
 from openviking.privacy.service import UserPrivacyConfigService
 from openviking.privacy.validation import validate_privacy_identifier
 from openviking.server.identity import RequestContext
@@ -255,7 +259,16 @@ class _SessionExtraction(_PayloadTransformer):
             return copied
         return self.get_reference(copied) if copied is not None else None
 
-    def get_reference(self, value: Any) -> str:
+    def get_reference(self, value: Any) -> Any:
+        # 原生提取器偶尔把 JSON 语法/工具输出碎片当秘密（如 ",\n        "）。
+        # 这类无字母数字的值入库后会进入全局子串替换表，摧毁落盘 JSON
+        # （2026-10-27 案：vault 值 ",\n        " 毒化所有 memory_diff.json），
+        # 因此原样返回，不入库、不占位。
+        if isinstance(value, str) and (
+            len(value) < MIN_PROTECTED_VALUE_CHARS
+            or not any(ch.isalnum() for ch in value)
+        ):
+            return value
         self.budget.record_match()
         if isinstance(value, str):
             matches = self.value_matcher(value)
