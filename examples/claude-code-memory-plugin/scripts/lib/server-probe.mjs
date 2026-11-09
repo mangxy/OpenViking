@@ -59,7 +59,11 @@ async function fetchWithTimeout(url, headers, ms) {
  */
 export async function probeServer(cfg, { ttlMs = DEFAULT_TTL_MS } = {}) {
   const cached = readCache();
-  if (cached && typeof cached.ts === "number" && Date.now() - cached.ts < ttlMs) {
+  // mengxy-patch: 未来时间戳守卫(2026-11-09, 2102时钟跳变案) — 系统时钟瞬间跳未来会让
+  // Date.now()-ts 得负数, 负数 < ttlMs 恒真 → 缓存永久判新鲜, statusline 永不复探活,
+  // server 死了也显示冷冻的 healthy 快照(停服窗口常绿案)。负差 = 视同过期强制重探。
+  const cacheAge = cached && typeof cached.ts === "number" ? Date.now() - cached.ts : Infinity;
+  if (cacheAge >= 0 && cacheAge < ttlMs) {
     if (cached.base_url === cfg.baseUrl) return cached;
   }
 
